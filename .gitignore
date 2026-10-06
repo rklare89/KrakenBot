@@ -1,0 +1,7 @@
+data/
+__pycache__/
+*.pyc
+bot.log
+bot_state*.json
+trade_ledger*.json
+.env

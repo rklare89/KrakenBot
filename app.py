@@ -52,13 +52,24 @@ WATCHLIST = ['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD']
 TIMEFRAME = '4h'
 RSI_PERIOD = 14
 EMA_PERIOD = 50
-RSI_OVERSOLD = 28                  # entry: RSI below this ...
-#                                    ... AND close above the EMA50 trend filter
+RSI_OVERSOLD = 28                  # entry RSI threshold (see RSI_ENTRY_MODE)
+RSI_ENTRY_MODE = 'below'           # 'below':    RSI(last closed candle) < RSI_OVERSOLD
+#                                    'cross_up': RSI crosses back up through RSI_OVERSOLD
+#                                                (prev candle < threshold <= last candle)
+TREND_FILTER = 'ema50'             # 'ema50':       close > EMA50
+#                                    'ema200':      close > EMA200
+#                                    'ema50_slope': EMA50 higher than EMA_SLOPE_LOOKBACK candles ago
+#                                    'none':        no trend filter
+EMA_LONG_PERIOD = 200
+EMA_SLOPE_LOOKBACK = 6
+STOPLOSS_COOLDOWN_HOURS = 0        # after a stop-loss exit, no new entry on that symbol for
+#                                    this many hours (0 or None = no cooldown)
 RSI_OVERBOUGHT = 68
 USE_RSI_OVERBOUGHT_EXIT = False    # optional extra exit (off by default). When on, it
 #                                    only fires if price is above the fee floor.
 CHECK_INTERVAL_SEC = 900
-OHLCV_LIMIT = 300                  # candles fetched per symbol for live signals (warm-up)
+OHLCV_LIMIT = 720                  # candles fetched per symbol for live signals (Kraken max;
+#                                    EMA200 needs the warm-up)
 POSITION_SIZE_PCT = 0.80           # fraction of free USD used per entry
 MIN_TRADE_USD = 10.0               # don't open positions smaller than this
 
@@ -219,6 +230,7 @@ def add_indicators(df):
     df = df.copy()
     df['rsi'] = calculate_rsi(df, period=RSI_PERIOD)
     df['ema_50'] = df['close'].ewm(span=EMA_PERIOD, min_periods=EMA_PERIOD).mean()
+    df['ema_200'] = df['close'].ewm(span=EMA_LONG_PERIOD, min_periods=EMA_LONG_PERIOD).mean()
     return df
 
 
@@ -240,13 +252,63 @@ def ohlcv_to_closed_df(ohlcv, timeframe, now_ms=None):
     return df.reset_index(drop=True)
 
 
-def check_entry_signal(rsi, close, ema):
-    """Entry rule. Returns (signal: bool, score: float)."""
-    if rsi is None or close is None or ema is None or pd.isna(rsi) or pd.isna(close) or pd.isna(ema):
+def entry_signals(df):
+    """Entry rule, shared by the live loop and the backtest.
+
+    df must contain CLOSED candles with indicators (add_indicators). Returns
+    (signal: bool Series, score: float Series); row i is the decision made once
+    candle i has closed. Higher score = more oversold (used to pick between symbols).
+    """
+    rsi, close = df['rsi'], df['close']
+    if RSI_ENTRY_MODE == 'cross_up':
+        prev_rsi = rsi.shift(1)
+        rsi_ok = (prev_rsi < RSI_OVERSOLD) & (rsi >= RSI_OVERSOLD)
+        score = RSI_OVERSOLD - prev_rsi
+    elif RSI_ENTRY_MODE == 'below':
+        rsi_ok = rsi < RSI_OVERSOLD
+        score = RSI_OVERSOLD - rsi
+    else:
+        raise ValueError(f"Unknown RSI_ENTRY_MODE {RSI_ENTRY_MODE!r}")
+
+    if TREND_FILTER == 'ema50':
+        trend_ok = close > df['ema_50']
+    elif TREND_FILTER == 'ema200':
+        trend_ok = close > df['ema_200']
+    elif TREND_FILTER == 'ema50_slope':
+        trend_ok = df['ema_50'] > df['ema_50'].shift(EMA_SLOPE_LOOKBACK)
+    elif TREND_FILTER == 'none':
+        trend_ok = df['ema_50'].notna()
+    else:
+        raise ValueError(f"Unknown TREND_FILTER {TREND_FILTER!r}")
+    signal = (rsi_ok & trend_ok).fillna(False).astype(bool)   # NaN warm-up -> no signal
+    return signal, score.fillna(0.0)
+
+
+def check_entry_signal(df):
+    """Convenience wrapper: (signal, score) for the last CLOSED candle of df."""
+    if df is None or len(df) == 0:
         return False, 0.0
-    if rsi < RSI_OVERSOLD and close > ema:
-        return True, RSI_OVERSOLD - rsi
-    return False, 0.0
+    signal, score = entry_signals(df)
+    return bool(signal.iloc[-1]), float(score.iloc[-1])
+
+
+def strategy_description():
+    rsi_txt = (f"RSI crosses back above {RSI_OVERSOLD}" if RSI_ENTRY_MODE == 'cross_up'
+               else f"RSI < {RSI_OVERSOLD}")
+    trend_txt = {'ema50': 'close > EMA50', 'ema200': f'close > EMA{EMA_LONG_PERIOD}',
+                 'ema50_slope': 'EMA50 rising', 'none': 'no trend filter'}.get(TREND_FILTER, TREND_FILTER)
+    parts = [f"entry {rsi_txt} + {trend_txt}"]
+    if TAKE_PROFIT_PCT is not None:
+        parts.append(f"+{TAKE_PROFIT_PCT * 100:g}% target")
+    if TRAIL_PCT is not None:
+        parts.append(f"{TRAIL_PCT * 100:g}% fee-floored trailing stop (armed at +{TRAIL_ACTIVATE_PCT * 100:g}%)")
+    if STOP_LOSS_PCT is not None:
+        parts.append(f"-{STOP_LOSS_PCT * 100:g}% stop-loss")
+    if MAX_HOLD_HOURS is not None:
+        parts.append(f"{MAX_HOLD_HOURS}h max hold")
+    if STOPLOSS_COOLDOWN_HOURS:
+        parts.append(f"{STOPLOSS_COOLDOWN_HOURS}h post-stop cooldown")
+    return ", ".join(parts)
 
 
 def fee_floor_price(entry_price):
@@ -323,6 +385,7 @@ def default_state():
     state = empty_position()
     state["pending_order"] = None
     state["last_entry_signal"] = {}   # symbol -> signal candle timestamp already traded
+    state["cooldowns"] = {}           # symbol -> ISO time until which new entries are blocked
     if DRY_RUN:
         state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
     return state
@@ -364,6 +427,8 @@ def load_state():
         state.update(loaded or {})
         if state.get("last_entry_signal") is None:
             state["last_entry_signal"] = {}
+        if state.get("cooldowns") is None:
+            state["cooldowns"] = {}
         if DRY_RUN and not state.get("paper"):
             state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
         return state
@@ -712,6 +777,10 @@ def apply_sell_fill(exchange, state, symbol, fill, reason):
                             f"closing tracked position.")
         state.update(empty_position())
         closed = True
+        if STOPLOSS_COOLDOWN_HOURS and str(reason).startswith("Stop-Loss"):
+            until = utc_now() + timedelta(hours=STOPLOSS_COOLDOWN_HOURS)
+            state.setdefault("cooldowns", {})[symbol] = until.isoformat()
+            logging.info(f"Stop-loss on {symbol}: no new entries until {fmt_ts(until)}.")
     save_state(state)
     save_trade("SELL", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
                fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason,
@@ -866,83 +935,120 @@ def _candle_path(o, h, l, c, steps):
     return path
 
 
-def backtest_on_dataframe(df, timeframe=TIMEFRAME, start_cash=BACKTEST_START_CASH):
-    """Simulate the live strategy on CLOSED candles (offline / testable).
+def simulate_exit_in_candle(pos, o, h, l, c, candle_start_ms, tf_sec, steps, rsi):
+    """Shared backtest exit model for one candle while a position is open.
 
-    - Entry: signal on closed candle i -> post-only buy at the open of candle i+1
-      (maker fee). Only one entry per signal candle (same rule as live).
-    - Exits: shared decide_exit() evaluated along an intra-candle path. Non-urgent
-      exits fill (maker fee) only if price >= the decision's min_price, mirroring the
-      fee-floored post-only sell; stop-loss fills at the path price minus slippage
-      with taker fee.
+    pos: dict with entry_price, peak, entry_time (aware datetime); pos['peak'] is updated.
+    Returns (fill_price, fee_rate, decision, exit_time) or None if still holding.
+    Non-urgent exits fill (maker fee) only if price >= decision.min_price, mirroring the
+    fee-floored post-only sell; stop-loss fills at the path price minus slippage with
+    taker fee.
     """
-    df = add_indicators(df)
+    candle_start = datetime.fromtimestamp(candle_start_ms / 1000, tz=timezone.utc)
+    candle_end = candle_start + timedelta(seconds=tf_sec)
+    # Fast path: decide_exit is monotone in price/peak/time, so if neither extreme of
+    # the candle (low with the highest possible peak, or high) at the candle's end
+    # triggers anything, nothing inside the candle can.
+    peak_hi = max(pos['peak'], h)
+    if decide_exit(pos['entry_price'], peak_hi, pos['entry_time'], l, candle_end, rsi=rsi) is None \
+            and decide_exit(pos['entry_price'], peak_hi, pos['entry_time'], h, candle_end, rsi=rsi) is None:
+        pos['peak'] = peak_hi
+        return None
+    path = _candle_path(o, h, l, c, steps)
+    n = len(path) - 1
+    for k, p in enumerate(path):
+        t = candle_start + timedelta(seconds=tf_sec * k / n)
+        pos['peak'] = max(pos['peak'], p)
+        d = decide_exit(pos['entry_price'], pos['peak'], pos['entry_time'], p, t, rsi=rsi)
+        if d is None:
+            continue
+        if d.urgent:
+            return p * (1 - BACKTEST_TAKER_SLIPPAGE_PCT), TAKER_FEE, d, t
+        if d.min_price is not None and p < d.min_price:
+            continue    # fee-floored post-only sell would not fill here
+        return p, MAKER_FEE, d, t
+    return None
+
+
+def backtest_on_dataframe(df, timeframe=TIMEFRAME, start_cash=BACKTEST_START_CASH,
+                          return_trades=False):
+    """Simulate the live strategy on CLOSED candles of one symbol (offline / testable).
+
+    - Entry: entry_signals() on closed candle i -> post-only buy at the open of candle
+      i+1 (maker fee), sized like live (POSITION_SIZE_PCT of cash). One entry per signal
+      candle; no entries during the post-stop-loss cooldown (same rules as live).
+    - Exits: shared decide_exit() via simulate_exit_in_candle().
+    df may already contain indicator columns (optimize.py precomputes them).
+    """
+    if 'rsi' not in df.columns or 'ema_200' not in df.columns:
+        df = add_indicators(df)
+    signal, _ = entry_signals(df)
+    sig = signal.to_numpy()
+    ts = df['timestamp'].to_numpy(dtype='int64')
+    o_, h_, l_, c_ = (df[k].to_numpy(dtype=float) for k in ('open', 'high', 'low', 'close'))
+    rsi_ = df['rsi'].to_numpy(dtype=float)
     tf_sec = ccxt.Exchange.parse_timeframe(timeframe)
     steps = max(4, int(tf_sec // CHECK_INTERVAL_SEC))
+    cooldown_ms = int((STOPLOSS_COOLDOWN_HOURS or 0) * 3_600_000)
 
     cash = start_cash
-    amount = 0.0
-    entry_price = peak = entry_cost = 0.0
-    entry_time = None
+    amount = entry_cost = 0.0
+    pos = None
+    cooldown_until = -1
     trades = wins = 0
-    pnls = []
+    pnls, trade_log = [], []
+    equity_peak, max_dd = start_cash, 0.0
 
-    for i in range(1, len(df)):
-        prev = df.iloc[i - 1]       # last closed candle when candle i is forming
-        row = df.iloc[i]
-        candle_start = datetime.fromtimestamp(row['timestamp'] / 1000, tz=timezone.utc)
-
+    for i in range(1, len(ts)):
         if amount == 0:
-            signal, _ = check_entry_signal(prev['rsi'], prev['close'], prev['ema_50'])
             trade_usd = cash * POSITION_SIZE_PCT
-            if signal and trade_usd >= MIN_TRADE_USD:
-                entry_price = float(row['open'])
-                fee = trade_usd * MAKER_FEE
-                amount = (trade_usd - fee) / entry_price
+            if sig[i - 1] and ts[i] >= cooldown_until and trade_usd >= MIN_TRADE_USD:
+                entry_price = o_[i]
+                amount = (trade_usd - trade_usd * MAKER_FEE) / entry_price
                 cash -= trade_usd
                 entry_cost = trade_usd
-                peak = entry_price
-                entry_time = candle_start
+                pos = {'entry_price': entry_price, 'peak': entry_price, 'entry_i': i,
+                       'entry_time': datetime.fromtimestamp(ts[i] / 1000, tz=timezone.utc)}
+            else:
+                continue    # flat: equity unchanged
 
-        if amount > 0:
-            path = _candle_path(float(row['open']), float(row['high']),
-                                float(row['low']), float(row['close']), steps)
-            for k, p in enumerate(path):
-                t = candle_start + timedelta(seconds=tf_sec * k / (len(path) - 1))
-                peak = max(peak, p)
-                d = decide_exit(entry_price, peak, entry_time, p, t, rsi=prev['rsi'])
-                if d is None:
-                    continue
-                if d.urgent:
-                    fill_price = p * (1 - BACKTEST_TAKER_SLIPPAGE_PCT)
-                    fee_rate = TAKER_FEE
-                else:
-                    if d.min_price is not None and p < d.min_price:
-                        continue    # fee-floored post-only sell would not fill here
-                    fill_price = p
-                    fee_rate = MAKER_FEE
-                gross = amount * fill_price
-                net = gross - gross * fee_rate
-                pnl = net - entry_cost
-                cash += net
-                trades += 1
-                wins += 1 if pnl > 0 else 0
-                pnls.append(pnl)
-                amount = 0.0
-                break
+        res = simulate_exit_in_candle(pos, o_[i], h_[i], l_[i], c_[i], ts[i], tf_sec, steps,
+                                      rsi_[i - 1])
+        if res is not None:
+            fill_price, fee_rate, d, t = res
+            gross = amount * fill_price
+            net = gross - gross * fee_rate
+            pnl = net - entry_cost
+            cash += net
+            trades += 1
+            wins += 1 if pnl > 0 else 0
+            pnls.append(pnl)
+            if return_trades:
+                trade_log.append({"entry_ts": int(ts[pos['entry_i']]), "exit_time": t.isoformat(),
+                                  "entry": pos['entry_price'], "exit": fill_price,
+                                  "reason": d.reason, "pnl": pnl, "ret": pnl / entry_cost})
+            if d.urgent and cooldown_ms:
+                cooldown_until = int(t.timestamp() * 1000) + cooldown_ms
+            amount = 0.0
+            pos = None
+        equity = cash + amount * c_[i]
+        equity_peak = max(equity_peak, equity)
+        max_dd = max(max_dd, (equity_peak - equity) / equity_peak)
 
-    final_val = cash + amount * float(df['close'].iloc[-1]) * (1 - MAKER_FEE) if len(df) else cash
-    days = 0.0
-    if len(df) > 1:
-        days = (df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]) / 86_400_000
-    return {
+    final_val = cash + amount * float(c_[-1]) * (1 - MAKER_FEE) if len(ts) else cash
+    days = (ts[-1] - ts[0]) / 86_400_000 if len(ts) > 1 else 0.0
+    out = {
         "return_pct": round((final_val - start_cash) / start_cash * 100, 2),
         "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
         "trades": trades,
         "open_position": amount > 0,
         "days": round(float(days), 1),
+        "max_drawdown_pct": round(max_dd * 100, 2),
         "pnls": pnls,
     }
+    if return_trades:
+        out["trade_log"] = trade_log
+    return out
 
 
 def fetch_ohlcv_history(exchange, symbol, timeframe, days):
@@ -975,7 +1081,7 @@ def run_backtest_simulation(symbol):
         exchange = get_public_exchange()
         candles = fetch_ohlcv_history(exchange, symbol, TIMEFRAME, BACKTEST_DAYS)
         df = ohlcv_to_closed_df(candles, TIMEFRAME)
-        if len(df) < EMA_PERIOD + 10:
+        if len(df) < EMA_LONG_PERIOD + 10:
             return {"symbol": name, "return_pct": 0.0, "win_rate": 0.0, "trades": 0, "days": 0}
         res = backtest_on_dataframe(df, TIMEFRAME)
         return {"symbol": name, "return_pct": res["return_pct"], "win_rate": res["win_rate"],
@@ -1001,13 +1107,13 @@ def update_scanner_cache():
 # =============================================================================
 # Live trading loop
 # =============================================================================
-def fetch_closed_indicators(exchange, symbol):
+def fetch_closed_indicators(exchange, symbol, return_df=False):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT)
     df = ohlcv_to_closed_df(ohlcv, TIMEFRAME, exchange.milliseconds())
     if len(df) < EMA_PERIOD + 1:
         return None
     df = add_indicators(df)
-    return df.iloc[-1]   # last CLOSED candle
+    return df if return_df else df.iloc[-1]   # last CLOSED candle
 
 
 def manage_position(exchange, state, free, total):
@@ -1107,13 +1213,19 @@ def scan_and_enter(exchange, state, usd_free):
             logging.warning(f"Skipping entries on symbols with open orders: {sorted(blocked)}")
 
     best = None
+    now = utc_now()
     for sym in WATCHLIST:
         if sym in blocked:
             continue
-        row = fetch_closed_indicators(exchange, sym)
-        if row is None:
+        cd_until = parse_iso((state.get("cooldowns") or {}).get(sym))
+        if cd_until and cd_until > now:
+            logging.info(f"{sym} in post-stop-loss cooldown until {fmt_ts(cd_until)}; skipping.")
             continue
-        signal, score = check_entry_signal(row['rsi'], row['close'], row['ema_50'])
+        df = fetch_closed_indicators(exchange, sym, return_df=True)
+        if df is None:
+            continue
+        row = df.iloc[-1]
+        signal, score = check_entry_signal(df)
         signal_ts = int(row['timestamp'])
         if signal and state.get("last_entry_signal", {}).get(sym) == signal_ts:
             continue    # already traded this exact signal candle
@@ -1122,7 +1234,7 @@ def scan_and_enter(exchange, state, usd_free):
 
     if best is None:
         bot_status["active_symbol"] = "None (Scanning Watchlist)"
-        bot_status["last_action"] = "No valid EMA + RSI setups found. Holding USD."
+        bot_status["last_action"] = "No valid entry setups found. Holding USD."
         return
     sym, score, row, signal_ts = best
     base, _ = market_base_quote(exchange, sym)
@@ -1264,7 +1376,7 @@ HTML_TEMPLATE = """
 
     <div class="card">
         <h2>Multi-Asset Rotation Scanner</h2>
-        <p style="font-size: 13px; color: #aaa;">Simulates ~{{ scanner.days }}-day performance of the live strategy ({{ timeframe }} candles: 50 EMA trend filter + RSI entry, target, fee-floored trailing stop, stop-loss, max hold), including Kraken fees. (Updated: {{ scanner.last_updated }})</p>
+        <p style="font-size: 13px; color: #aaa;">Simulates ~{{ scanner.days }}-day performance of the live strategy ({{ timeframe }} candles: {{ strategy }}), including Kraken fees. (Updated: {{ scanner.last_updated }})</p>
         <table>
             <tr><th>Asset</th><th>{{ scanner.days }}-Day Return</th><th>Win Rate</th><th>Trades Executed</th></tr>
             {% for item in scanner.results %}
@@ -1321,6 +1433,7 @@ def dashboard():
             trades=pnl_data[-10:],
             scanner=scanner_cache,
             timeframe=TIMEFRAME,
+            strategy=strategy_description(),
             dry_run=DRY_RUN
         )
     except Exception as e:
