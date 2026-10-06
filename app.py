@@ -1,12 +1,17 @@
 import os
 import time
 import json
+import hmac
+import random
+import tempfile
 import threading
 import logging
-from datetime import datetime, timedelta
+from collections import namedtuple
+from datetime import datetime, timedelta, timezone
 import ccxt
+import numpy as np
 import pandas as pd
-from flask import Flask, render_template_string
+from flask import Flask, Response, request, render_template_string
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -23,14 +28,196 @@ console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logging.getLogger('').addHandler(console_handler)
 
-# Watchlist & Configuration Parameters
+
+def _env_flag(name, default=False):
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+# --- Mode -------------------------------------------------------------------
+# DRY_RUN=true  -> paper trading: orders are logged, not sent. Fills are simulated
+#                  at the limit price against a paper wallet (DRY_RUN_USD_BALANCE),
+#                  and state/ledger go to separate *.dryrun.json files.
+#                  No API keys are required in this mode.
+# DRY_RUN unset/false -> LIVE trading (same as the original bot).
+DRY_RUN = _env_flag("DRY_RUN", False)
+DRY_RUN_USD_BALANCE = float(os.getenv("DRY_RUN_USD_BALANCE", "1000"))
+
+# --- Watchlist & signals (defaults unchanged from the original bot) -----------
 WATCHLIST = ['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD']
 TIMEFRAME = '4h'
-RSI_OVERSOLD = 28
+RSI_PERIOD = 14
+EMA_PERIOD = 50
+RSI_OVERSOLD = 28                  # entry RSI threshold (see RSI_ENTRY_MODE)
+RSI_ENTRY_MODE = 'below'           # 'below':    RSI(last closed candle) < RSI_OVERSOLD
+#                                    'cross_up': RSI crosses back up through RSI_OVERSOLD
+#                                                (prev candle < threshold <= last candle)
+TREND_FILTER = 'ema50'             # 'ema50':       close > EMA50
+#                                    'ema200':      close > EMA200
+#                                    'ema50_slope': EMA50 higher than EMA_SLOPE_LOOKBACK candles ago
+#                                    'none':        no trend filter
+EMA_LONG_PERIOD = 200
+EMA_SLOPE_LOOKBACK = 6
+STOPLOSS_COOLDOWN_HOURS = 72       # after a stop-loss exit, no new entry on that symbol for
+#                                    this many hours (0 or None = no cooldown)
 RSI_OVERBOUGHT = 68
+USE_RSI_OVERBOUGHT_EXIT = False    # optional extra exit (off by default). When on, it
+#                                    only fires if price is above the fee floor.
 CHECK_INTERVAL_SEC = 900
-LEDGER_FILE = 'trade_ledger.json'
-STATE_FILE = 'bot_state.json'
+OHLCV_LIMIT = 720                  # candles fetched per symbol for live signals (Kraken max;
+#                                    EMA200 needs the warm-up)
+POSITION_SIZE_PCT = 0.80           # fraction of free USD used per entry
+MIN_TRADE_USD = 10.0               # don't open positions smaller than this
+
+# --- Fees (Kraken Pro starting tier; change if your tier differs) ------------
+MAKER_FEE = 0.0025
+TAKER_FEE = 0.0040
+# Entries and profit-taking exits are post-only (maker) orders, so a normal round
+# trip pays maker fees on both legs. Set to MAKER_FEE + TAKER_FEE to be stricter.
+ROUND_TRIP_FEE = 2 * MAKER_FEE
+MIN_PROFIT_MARGIN = 0.002          # required net profit above fees for the trailing floor
+
+# --- Exits -------------------------------------------------------------------
+TAKE_PROFIT_PCT = 0.03             # +3% target (original behaviour)
+TRAIL_ACTIVATE_PCT = 0.015         # trailing stop arms once the peak is >= entry +1.5%
+TRAIL_PCT = 0.01                   # trail 1% below the peak ...
+#   ... but never below the fee floor: entry * (1 + ROUND_TRIP_FEE + MIN_PROFIT_MARGIN)
+STOP_LOSS_PCT = 0.05               # exit if price <= entry * (1 - 5%).  None = disabled
+MAX_HOLD_HOURS = 72                # exit after this many hours in a trade. None = disabled
+# NOTE: STOP_LOSS_PCT is enforced by this bot's polling loop (every CHECK_INTERVAL_SEC),
+# so it does not protect you if the PC/bot is offline or during a fast crash between
+# checks. A further option is an exchange-side stop order (Kraken 'stop-loss' order
+# type) placed right after each buy, so the exchange enforces it even when the bot
+# is down. That is not implemented here because it reserves the balance and needs
+# its own cancel/replace handling on every exit.
+STOP_LOSS_MAX_SLIPPAGE_PCT = 0.01  # stop-loss uses a marketable limit at bid*(1-this)
+STOP_LOSS_RETRIES = 3              # re-price & retry the stop-loss exit this many times
+
+# --- Order handling ------------------------------------------------------------
+ORDER_TIMEOUT_SEC = 300            # cancel unfilled (post-only) orders after this long
+STOP_LOSS_ORDER_TIMEOUT_SEC = 60   # shorter wait for urgent exits
+ORDER_POLL_SEC = 5                 # fetch_order polling interval
+PENDING_ORDER_GIVE_UP_SEC = max(2 * ORDER_TIMEOUT_SEC, 900)  # unknown-order resolution
+CANCEL_STRAY_ORDERS_ON_START = False  # cancel open watchlist orders not created by this bot
+POSITION_TOLERANCE_PCT = 0.01      # balance-vs-state mismatch tolerance at reconcile
+
+# --- Backtest / scanner ----------------------------------------------------------
+BACKTEST_DAYS = 180                # NOTE: Kraken's OHLC API only serves the latest 720
+#                                    candles (~120 days on 4h); the dashboard shows the
+#                                    actual number of days covered.
+BACKTEST_START_CASH = 1000.0
+BACKTEST_TAKER_SLIPPAGE_PCT = 0.001  # extra slippage assumed on stop-loss (taker) exits
+SCANNER_REFRESH_SEC = 3600
+
+# --- Trend-following (used by STRATEGY_PRESET=trend; see CHANGES.md) ----------------
+# Daily Donchian breakout: buy when the daily close is above the highest high of the
+# previous TREND_ENTRY_DAYS days AND above its TREND_MA_DAYS simple moving average.
+# Exit when the daily close falls below the lowest low of the previous TREND_EXIT_DAYS
+# days, or intraday if price touches the ATR trailing stop (highest close since entry
+# minus TREND_ATR_MULT x ATR). Up to TREND_MAX_POSITIONS positions, each sized
+# POSITION_SIZE_PCT / TREND_MAX_POSITIONS of account equity (80%/10 = 8% each).
+STRATEGY_MODE = 'rsi'              # 'rsi' (single position, presets conservative/tuned_a),
+#                                    'trend' or 'momentum' (multi-position portfolios)
+TREND_TIMEFRAME = '1d'
+TREND_ENTRY_DAYS = 55
+TREND_MA_DAYS = 200                # 0 = no moving-average filter
+TREND_EXIT_DAYS = 10               # None = no Donchian-low exit
+TREND_ATR_MULT = 6                 # None = no ATR trailing stop
+TREND_ATR_PERIOD = 14
+TREND_MAX_POSITIONS = 10
+TREND_REGIME_FILTER = False        # True: only enter while BTC/USD close > its 200-day MA
+TREND_MAX_ENTRY_CHASE_PCT = 0.03   # skip an entry if the bid ran >3% above the signal close
+TREND_EXIT_MAX_ATTEMPTS = 4        # post-only exit attempts before switching to a
+#                                    marketable (taker) limit
+
+# --- Momentum rotation ('momentum' mode; opt-in via STRATEGY_PRESET=momentum) ---------
+# Once per closed daily candle (UTC), rank the watchlist by 30/60/90-day return. A coin
+# qualifies when it is in the top MOMENTUM_TOP_K on at least 2 of the 3 lookbacks
+# ("consensus"), and (absolute filter) has a positive return on at least 2 of 3. Every
+# MOMENTUM_REBALANCE_DAYS hold the top MOMENTUM_TOP_K qualifiers, each sized
+# MOMENTUM_EXPOSURE / TOP_K of equity scaled by min(1, MOMENTUM_VOL_TARGET / 30-day
+# annualised volatility). Hold USD while BTC/USD closes below its 200-day MA (checked
+# daily; existing holdings are sold). Coins that drop out are sold at the next rebalance.
+MOMENTUM_LOOKBACKS = (30, 60, 90)  # days; 3 lookbacks = 2-of-3 consensus, 1 = plain ranking
+MOMENTUM_TOP_K = 2
+MOMENTUM_REBALANCE_DAYS = 7
+MOMENTUM_ABS_FILTER = True
+MOMENTUM_REGIME_FILTER = True      # hold USD unless BTC/USD close > its MA below
+MOMENTUM_REGIME_MA_DAYS = 200
+MOMENTUM_VOL_TARGET = 0.60         # annualised; None = equal weights
+MOMENTUM_VOL_DAYS = 30
+MOMENTUM_EXPOSURE = 0.80           # max fraction of equity invested (sum of all weights)
+MOMENTUM_MAX_WEIGHT = None         # optional per-coin cap (fraction of equity)
+MOMENTUM_REBALANCE_DRIFT = 0.5     # resize a coin that stays selected only if its value
+#                                    is more than 50% away from its target (None = never)
+MOMENTUM_MAX_INVESTED = 0.80      # buys never take holdings above 80% of equity (None = off)
+MOMENTUM_MAX_ENTRY_CHASE_PCT = 0.05  # drop a queued buy if the ask ran >5% above the signal close
+MOMENTUM_ORDER_MAX_ATTEMPTS = 4    # post-only attempts before a marketable-limit fallback
+MOMENTUM_DATA_GRACE_SEC = 7200     # wait up to 2h after the daily close for every coin's candle
+
+# --- Strategy presets ----------------------------------------------------------------
+# Tuning (optimize.py, Oct 2026; Coinbase 4h history Jan 2023 - Oct 2026, train = first
+# 65% of the calendar span, test = last 35% (Jun 2025 - Oct 2026), plus Kraken's own last
+# 120 days) found NO parameter set that was robustly profitable out-of-sample on the
+# 5-coin watchlist. The default is therefore the conservative preset: the original rules
+# (which rarely trigger) plus a 72h post-stop-loss cooldown. See CHANGES.md.
+#
+# 'tuned_a' is the best train-period set (RSI<33 dip-buying above EMA200, quick +2%
+# target, wide 12% stop, up to 10 days hold) on a 10-coin universe. Out-of-sample it was
+# only marginally positive (+1.9% mean per coin over 16 months, 7/10 coins up, rotation
+# portfolio +2.2% with ~20% max drawdown) and NEGATIVE on the 5-coin watchlist alone.
+# It is opt-in only: try it with DRY_RUN=true STRATEGY_PRESET=tuned_a first.
+STRATEGY_PRESETS = {
+    'conservative': {},
+    'tuned_a': dict(
+        WATCHLIST=['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD',
+                   'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
+        RSI_OVERSOLD=33, RSI_ENTRY_MODE='below', TREND_FILTER='ema200',
+        TAKE_PROFIT_PCT=0.02, TRAIL_PCT=0.02, TRAIL_ACTIVATE_PCT=0.015,
+        STOP_LOSS_PCT=0.12, MAX_HOLD_HOURS=240, STOPLOSS_COOLDOWN_HOURS=72,
+    ),
+    # Trend-following portfolio (daily). Out-of-sample Jun 2025 - Oct 2026 (BTC -21%):
+    # +9.2% with 13.9% max drawdown on 10 coins, +7.3% / 9.6% on the 5-coin watchlist;
+    # 966 of 1008 tested parameter sets were positive out-of-sample. Opt-in only.
+    'trend': dict(
+        STRATEGY_MODE='trend',
+        WATCHLIST=['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD',
+                   'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
+        TREND_ENTRY_DAYS=55, TREND_MA_DAYS=200, TREND_EXIT_DAYS=10, TREND_ATR_MULT=6,
+        TREND_MAX_POSITIONS=10, TREND_REGIME_FILTER=False,
+    ),
+    # Momentum rotation (daily). Out-of-sample Jun 2025 - Oct 2026 on these 10 coins:
+    # +35.9% with 22.4% max drawdown (Kraken data +36.0% / 22.4%; +30.7% with taker fees
+    # and 0.3% slippage); train Jan 2023 - Jun 2025 +288% / 27.5% DD. Expect less live:
+    # the coin list itself was chosen with hindsight (see CHANGES.md). Opt-in only.
+    'momentum': dict(
+        STRATEGY_MODE='momentum',
+        WATCHLIST=['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD',
+                   'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
+        MOMENTUM_LOOKBACKS=(30, 60, 90), MOMENTUM_TOP_K=2, MOMENTUM_REBALANCE_DAYS=7,
+        MOMENTUM_ABS_FILTER=True, MOMENTUM_REGIME_FILTER=True, MOMENTUM_VOL_TARGET=0.60,
+        MOMENTUM_EXPOSURE=0.80,
+    ),
+}
+STRATEGY_PRESET = os.getenv("STRATEGY_PRESET", "conservative").strip().lower()
+if STRATEGY_PRESET not in STRATEGY_PRESETS:
+    raise SystemExit(f"Unknown STRATEGY_PRESET {STRATEGY_PRESET!r}; choose one of {sorted(STRATEGY_PRESETS)}")
+globals().update(STRATEGY_PRESETS[STRATEGY_PRESET])
+
+# --- Files -------------------------------------------------------------------------
+LEDGER_FILE = 'trade_ledger.dryrun.json' if DRY_RUN else 'trade_ledger.json'
+STATE_FILE = 'bot_state.dryrun.json' if DRY_RUN else 'bot_state.json'
+
+# --- Dashboard -------------------------------------------------------------------------
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")   # use 0.0.0.0 for LAN access
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
+DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")        # unset = no auth
 
 app = Flask(__name__)
 
@@ -50,39 +237,523 @@ bot_status = {
 
 scanner_cache = {
     "last_updated": "Never",
+    "days": BACKTEST_DAYS,
     "results": []
 }
 
-def get_exchange():
-    return ccxt.kraken({
-        'apiKey': os.getenv("KRAKEN_API_KEY"),
-        'secret': os.getenv("KRAKEN_SECRET_KEY"),
-        'enableRateLimit': True
-    })
 
+# =============================================================================
+# Time helpers (always timezone-aware UTC)
+# =============================================================================
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def fmt_ts(dt):
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# =============================================================================
+# Exchange (created once, reused)
+# =============================================================================
+_exchange = None
+_public_exchange = None
+_exchange_init_lock = threading.Lock()
+
+
+def get_exchange():
+    """Trading exchange instance (with API keys). Created once; markets loaded once."""
+    global _exchange
+    with _exchange_init_lock:
+        if _exchange is None:
+            _exchange = ccxt.kraken({
+                'apiKey': os.getenv("KRAKEN_API_KEY"),
+                'secret': os.getenv("KRAKEN_SECRET_KEY"),
+                'enableRateLimit': True
+            })
+        return _exchange
+
+
+def get_public_exchange():
+    """Separate key-less instance for the scanner thread (public data only), so the
+    scanner never shares a ccxt object / nonce with the trading thread."""
+    global _public_exchange
+    with _exchange_init_lock:
+        if _public_exchange is None:
+            _public_exchange = ccxt.kraken({'enableRateLimit': True})
+        return _public_exchange
+
+
+def ensure_markets(exchange):
+    """Load markets once (ccxt caches them on the instance)."""
+    if not exchange.markets:
+        exchange.load_markets()
+    return exchange.markets
+
+
+# =============================================================================
+# Indicators & shared strategy logic (used by BOTH the live loop and backtest)
+# =============================================================================
 def calculate_rsi(data, period=14):
+    """RSI with Wilder's smoothing (EMA with alpha = 1/period)."""
     delta = data['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    # No losses in the window -> RSI 100 (avoid NaN from division by zero);
+    # completely flat window -> 50.
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
+    return rsi
+
+
+def add_indicators(df):
+    df = df.copy()
+    df['rsi'] = calculate_rsi(df, period=RSI_PERIOD)
+    df['ema_50'] = df['close'].ewm(span=EMA_PERIOD, min_periods=EMA_PERIOD).mean()
+    df['ema_200'] = df['close'].ewm(span=EMA_LONG_PERIOD, min_periods=EMA_LONG_PERIOD).mean()
+    return df
+
+
+def ohlcv_to_closed_df(ohlcv, timeframe, now_ms=None):
+    """Build a DataFrame of CLOSED candles only.
+
+    Kraken returns the still-forming candle as the last row; signals must use the
+    last closed candle (i.e. what used to be iloc[-2]). We drop the last row when
+    its period hasn't ended yet, so df.iloc[-1] is always the last closed candle.
+    """
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    if df.empty:
+        return df
+    tf_ms = ccxt.Exchange.parse_timeframe(timeframe) * 1000
+    if now_ms is None:
+        now_ms = int(utc_now().timestamp() * 1000)
+    if df['timestamp'].iloc[-1] + tf_ms > now_ms:
+        df = df.iloc[:-1]
+    return df.reset_index(drop=True)
+
+
+def entry_signals(df):
+    """Entry rule, shared by the live loop and the backtest.
+
+    df must contain CLOSED candles with indicators (add_indicators). Returns
+    (signal: bool Series, score: float Series); row i is the decision made once
+    candle i has closed. Higher score = more oversold (used to pick between symbols).
+    """
+    rsi, close = df['rsi'], df['close']
+    if RSI_ENTRY_MODE == 'cross_up':
+        prev_rsi = rsi.shift(1)
+        rsi_ok = (prev_rsi < RSI_OVERSOLD) & (rsi >= RSI_OVERSOLD)
+        score = RSI_OVERSOLD - prev_rsi
+    elif RSI_ENTRY_MODE == 'below':
+        rsi_ok = rsi < RSI_OVERSOLD
+        score = RSI_OVERSOLD - rsi
+    else:
+        raise ValueError(f"Unknown RSI_ENTRY_MODE {RSI_ENTRY_MODE!r}")
+
+    if TREND_FILTER == 'ema50':
+        trend_ok = close > df['ema_50']
+    elif TREND_FILTER == 'ema200':
+        trend_ok = close > df['ema_200']
+    elif TREND_FILTER == 'ema50_slope':
+        trend_ok = df['ema_50'] > df['ema_50'].shift(EMA_SLOPE_LOOKBACK)
+    elif TREND_FILTER == 'none':
+        trend_ok = df['ema_50'].notna()
+    else:
+        raise ValueError(f"Unknown TREND_FILTER {TREND_FILTER!r}")
+    signal = (rsi_ok & trend_ok).fillna(False).astype(bool)   # NaN warm-up -> no signal
+    return signal, score.fillna(0.0)
+
+
+def check_entry_signal(df):
+    """Convenience wrapper: (signal, score) for the last CLOSED candle of df."""
+    if df is None or len(df) == 0:
+        return False, 0.0
+    signal, score = entry_signals(df)
+    return bool(signal.iloc[-1]), float(score.iloc[-1])
+
+
+def strategy_description():
+    if STRATEGY_MODE == 'momentum':
+        lbs = '/'.join(str(d) for d in MOMENTUM_LOOKBACKS)
+        rule = (f"top {MOMENTUM_TOP_K} on at least 2 of the {lbs}-day returns" if len(MOMENTUM_LOOKBACKS) == 3
+                else f"top {MOMENTUM_TOP_K} by {lbs}-day return")
+        parts = [f"daily momentum rotation: hold the {rule}"]
+        if MOMENTUM_ABS_FILTER:
+            parts.append("only coins with positive momentum")
+        parts.append(f"rebalance every {MOMENTUM_REBALANCE_DAYS} days")
+        if MOMENTUM_REGIME_FILTER:
+            parts.append(f"USD while BTC < {MOMENTUM_REGIME_MA_DAYS}-day MA")
+        parts.append(f"up to {MOMENTUM_EXPOSURE * 100:.0f}% of equity"
+                     + (f", sized to {MOMENTUM_VOL_TARGET * 100:.0f}%/yr volatility" if MOMENTUM_VOL_TARGET else ""))
+        return ", ".join(parts)
+    if STRATEGY_MODE == 'trend':
+        parts = [f"daily close above prior {TREND_ENTRY_DAYS}-day high"
+                 + (f" and above {TREND_MA_DAYS}-day MA" if TREND_MA_DAYS else "")]
+        if TREND_EXIT_DAYS:
+            parts.append(f"exit on close below prior {TREND_EXIT_DAYS}-day low")
+        if TREND_ATR_MULT:
+            parts.append(f"{TREND_ATR_MULT}x ATR trailing stop")
+        if TREND_REGIME_FILTER:
+            parts.append("only while BTC > 200-day MA")
+        parts.append(f"up to {TREND_MAX_POSITIONS} positions of "
+                     f"{POSITION_SIZE_PCT / TREND_MAX_POSITIONS * 100:.0f}% equity")
+        return ", ".join(parts)
+    rsi_txt = (f"RSI crosses back above {RSI_OVERSOLD}" if RSI_ENTRY_MODE == 'cross_up'
+               else f"RSI < {RSI_OVERSOLD}")
+    trend_txt = {'ema50': 'close > EMA50', 'ema200': f'close > EMA{EMA_LONG_PERIOD}',
+                 'ema50_slope': 'EMA50 rising', 'none': 'no trend filter'}.get(TREND_FILTER, TREND_FILTER)
+    parts = [f"entry {rsi_txt} + {trend_txt}"]
+    if TAKE_PROFIT_PCT is not None:
+        parts.append(f"+{TAKE_PROFIT_PCT * 100:g}% target")
+    if TRAIL_PCT is not None:
+        parts.append(f"{TRAIL_PCT * 100:g}% fee-floored trailing stop (armed at +{TRAIL_ACTIVATE_PCT * 100:g}%)")
+    if STOP_LOSS_PCT is not None:
+        parts.append(f"-{STOP_LOSS_PCT * 100:g}% stop-loss")
+    if MAX_HOLD_HOURS is not None:
+        parts.append(f"{MAX_HOLD_HOURS}h max hold")
+    if STOPLOSS_COOLDOWN_HOURS:
+        parts.append(f"{STOPLOSS_COOLDOWN_HOURS}h post-stop cooldown")
+    return ", ".join(parts)
+
+
+# ----------------------------------------------------------------------------- trend helpers
+# Shared by the live 'trend' loop and portfolio_backtest.py (which sets the TREND_*
+# globals from its parameter grid). They accept pandas objects or scalars.
+def bars_per_day(timeframe):
+    return max(1, 86400 // ccxt.Exchange.parse_timeframe(timeframe))
+
+
+def donchian_high(high, n):
+    """Highest high of the PREVIOUS n bars (excludes the current bar)."""
+    return high.rolling(n, min_periods=n).max().shift(1)
+
+
+def donchian_low(low, n):
+    return low.rolling(n, min_periods=n).min().shift(1)
+
+
+def wilder_atr(high, low, close, period=14):
+    prev_close = close.shift(1)
+    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def add_trend_indicators(df, timeframe=None):
+    timeframe = timeframe or TREND_TIMEFRAME
+    bpd = bars_per_day(timeframe)
+    df = df.copy()
+    df['donch_hi'] = donchian_high(df['high'], int(TREND_ENTRY_DAYS * bpd))
+    df['donch_lo'] = donchian_low(df['low'], int(TREND_EXIT_DAYS * bpd)) if TREND_EXIT_DAYS else np.nan
+    n_ma = int((TREND_MA_DAYS or 0) * bpd)
+    df['ma'] = df['close'].rolling(n_ma, min_periods=n_ma).mean() if n_ma else np.nan
+    df['atr'] = wilder_atr(df['high'], df['low'], df['close'], TREND_ATR_PERIOD)
+    return df
+
+
+def trend_entry_signal(close, donch_hi, ma):
+    """Breakout above the prior N-day high, and above the long MA if enabled."""
+    if close is None or donch_hi is None or pd.isna(close) or pd.isna(donch_hi):
+        return False
+    if close <= donch_hi:
+        return False
+    if TREND_MA_DAYS:
+        return ma is not None and not pd.isna(ma) and close > ma
+    return True
+
+
+def trend_entry_strength(close, donch_hi):
+    return close / donch_hi if donch_hi else 0.0
+
+
+def trend_exit_signal(close, donch_lo):
+    if not TREND_EXIT_DAYS or donch_lo is None or pd.isna(donch_lo) or pd.isna(close):
+        return False
+    return close < donch_lo
+
+
+def trend_initial_stop(entry_price, atr):
+    if not TREND_ATR_MULT or atr is None or pd.isna(atr):
+        return None
+    return entry_price - TREND_ATR_MULT * atr
+
+
+def trend_update_stop(stop, highest_close, atr):
+    """Trailing stop only ever moves up: highest close since entry - mult x ATR."""
+    if not TREND_ATR_MULT or atr is None or pd.isna(atr):
+        return stop
+    new = highest_close - TREND_ATR_MULT * atr
+    return new if stop is None else max(stop, new)
+
+
+def trend_stop_hit(price, stop):
+    return stop is not None and price is not None and price <= stop
+
+
+# ----------------------------------------------------------------------------- momentum helpers
+# Shared by the live 'momentum' loop and portfolio_backtest.momentum_sim. Inputs are
+# pandas Series/DataFrames of CLOSED candles (rows = bars) or plain numpy rows.
+def momentum_returns(close, days, bpd=1):
+    """Return over the last `days` days: close / close `days` bars ago - 1."""
+    n = int(days * bpd)
+    return close / close.shift(n) - 1
+
+
+def momentum_volatility(close, days=30, bpd=1):
+    """Annualised standard deviation of log returns over `days` days."""
+    n = int(days * bpd)
+    return np.log(close).diff().rolling(n, min_periods=n).std() * np.sqrt(365 * bpd)
+
+
+def sma_regime(close, days=200, bpd=1):
+    """True where close > its `days`-day simple moving average (False while warming up)."""
+    n = int(days * bpd)
+    return close > close.rolling(n, min_periods=n).mean()
+
+
+def momentum_targets(rets_row, regime_ok, top_k, abs_filter):
+    """Indices of the top_k coins by return (NaN skipped); empty if the regime is off;
+    optional absolute-momentum filter (return > 0)."""
+    if not regime_ok:
+        return []
+    order = [j for j in np.argsort(-np.nan_to_num(rets_row, nan=-np.inf)) if np.isfinite(rets_row[j])]
+    if abs_filter:
+        order = [j for j in order if rets_row[j] > 0]
+    return order[:top_k]
+
+
+def momentum_select(rets_rows, regime_ok, top_k, abs_filter, mask=None):
+    """Ranking rule. rets_rows: list of 1 or 3 numpy return rows (one per lookback).
+    One lookback -> momentum_targets(). Three -> consensus: a coin qualifies if it is in
+    the top_k on at least 2 of the 3 lookbacks (ordered by mean rank); the absolute filter
+    then needs a positive return on at least 2 of 3. mask: coins allowed."""
+    if not regime_ok:
+        return []
+    rows = [np.where(mask, r, np.nan) if mask is not None else np.asarray(r, dtype=float) for r in rets_rows]
+    if len(rows) == 1:
+        return momentum_targets(rows[0], True, top_k, abs_filter)
+    votes, ranks = {}, {}
+    for r in rows:
+        order = [j for j in np.argsort(-np.nan_to_num(r, nan=-np.inf)) if np.isfinite(r[j])]
+        for pos, j in enumerate(order):
+            ranks.setdefault(j, []).append(pos)
+            if pos < top_k:
+                votes[j] = votes.get(j, 0) + 1
+    picks = [j for j, v in votes.items() if v >= 2 and len(ranks[j]) == len(rows)]
+    if abs_filter:
+        picks = [j for j in picks if sum(r[j] > 0 for r in rows) >= 2]
+    picks.sort(key=lambda j: np.mean(ranks[j]))
+    return picks[:top_k]
+
+
+def momentum_weight(top_k, vol=None, vol_target=None, max_weight=None, exposure=0.80):
+    """Fraction of equity for one holding: exposure/top_k, scaled by vol_target/vol when
+    volatility targeting is on (0 = don't buy if volatility is unknown), capped at
+    max_weight. With top_k holdings the total never exceeds `exposure`."""
+    w = exposure / top_k
+    if vol_target:
+        if vol is None or not np.isfinite(vol) or vol <= 0:
+            return 0.0
+        w *= min(1.0, vol_target / vol)
+    if max_weight:
+        w = min(w, max_weight)
+    return w
+
+
+def momentum_exits(held, targets):
+    """Holdings to sell completely: everything not in the new target list."""
+    return [k for k in held if k not in targets]
+
+
+def momentum_buys(held_values, targets, weights, equity, drift=None, min_trade=10.0,
+                  trim=False, max_invested=None):
+    """USD orders after the exits. held_values: {key: current USD value} of every holding
+    left after the exits; weights: {key: target fraction of equity}.
+    - New targets are bought at weight x equity (best-ranked first).
+    - A target that is already held is topped up only when it is more than `drift` x
+      target BELOW its target (None = never); with trim=True it is also cut back when more
+      than `drift` above (off by default: trimming winners cost ~90 points in train).
+    - max_invested: cap on (value of all holdings + new buys) as a fraction of equity.
+    - Orders below min_trade are dropped.
+    Returns {key: usd} (negative = sell that much)."""
+    orders = {}
+    room = (max_invested * equity - sum(held_values.values())) if max_invested is not None else float('inf')
+    for k in targets:
+        tgt = weights.get(k, 0.0) * equity
+        if k not in held_values:
+            usd = min(tgt, room)
+        elif drift is not None and tgt > 0 and abs(tgt - held_values[k]) > drift * tgt:
+            usd = tgt - held_values[k]
+            if usd > 0:
+                usd = min(usd, room)
+            elif not trim:
+                continue
+        else:
+            continue
+        if abs(usd) >= min_trade:
+            orders[k] = usd
+            room -= usd
+    return orders
+
+
+def fee_floor_price(entry_price):
+    """Lowest exit price that is still profitable after round-trip fees + margin."""
+    return entry_price * (1 + ROUND_TRIP_FEE + MIN_PROFIT_MARGIN)
+
+
+def trailing_stop_price(entry_price, peak_price):
+    return max(peak_price * (1 - TRAIL_PCT), fee_floor_price(entry_price))
+
+
+ExitDecision = namedtuple('ExitDecision', ['reason', 'urgent', 'min_price'])
+# reason:    human readable reason
+# urgent:    True -> get out now (marketable limit, taker fee acceptable)
+# min_price: lowest acceptable sell price for non-urgent exits (None = any price)
+
+
+def decide_exit(entry_price, peak_price, entry_time, price, now, rsi=None):
+    """Single exit-decision function shared by the live loop and the backtest.
+
+    entry_price: average fill price of the position
+    peak_price:  highest observed price since entry (caller keeps it updated)
+    entry_time:  aware datetime of the entry fill (None = unknown)
+    price:       current price
+    now:         aware datetime
+    rsi:         RSI of the last CLOSED candle (only used by the optional RSI exit)
+    """
+    if not entry_price or entry_price <= 0 or price is None:
+        return None
+    peak = max(peak_price or 0.0, price)
+    floor = fee_floor_price(entry_price)
+
+    # 1) Hard stop-loss (downside protection, highest priority)
+    if STOP_LOSS_PCT is not None and price <= entry_price * (1 - STOP_LOSS_PCT):
+        return ExitDecision(f"Stop-Loss -{STOP_LOSS_PCT * 100:.1f}%", True, None)
+
+    # 2) Take-profit target
+    if TAKE_PROFIT_PCT is not None and price >= entry_price * (1 + TAKE_PROFIT_PCT):
+        return ExitDecision(f"{TAKE_PROFIT_PCT * 100:.0f}% Target Hit", False, floor)
+
+    # 3) Fee-floored trailing stop (armed once the peak reached entry + TRAIL_ACTIVATE_PCT)
+    if TRAIL_PCT is not None and peak >= entry_price * (1 + TRAIL_ACTIVATE_PCT):
+        if price <= trailing_stop_price(entry_price, peak):
+            return ExitDecision("Trailing Stop Triggered", False, floor)
+
+    # 4) Optional RSI overbought exit (only when profitable after fees)
+    if USE_RSI_OVERBOUGHT_EXIT and rsi is not None and not pd.isna(rsi) \
+            and rsi > RSI_OVERBOUGHT and price >= floor:
+        return ExitDecision(f"RSI Overbought ({rsi:.1f})", False, floor)
+
+    # 5) Max holding time (time stop; may realise a small loss, maker order at ask)
+    if MAX_HOLD_HOURS is not None and entry_time is not None \
+            and now - entry_time >= timedelta(hours=MAX_HOLD_HOURS):
+        return ExitDecision(f"Max Hold {MAX_HOLD_HOURS}h Reached", False, None)
+
+    return None
+
+
+# =============================================================================
+# State & ledger (atomic JSON writes)
+# =============================================================================
+def empty_position():
+    return {
+        "symbol": None,
+        "last_buy_price": 0.0,   # average entry fill price
+        "peak_price": 0.0,
+        "amount": 0.0,           # base amount held by this position (from fills)
+        "entry_time": None,      # ISO-8601 UTC
+        "entry_cost": 0.0,       # quote spent incl. quote-denominated fees
+    }
+
+
+def default_state():
+    state = empty_position()
+    state["pending_order"] = None
+    state["last_entry_signal"] = {}   # symbol -> signal candle timestamp already traded
+    state["cooldowns"] = {}           # symbol -> ISO time until which new entries are blocked
+    state["positions"] = {}           # 'trend' mode: symbol -> position dict
+    state["trend_last_bar"] = None    # 'trend' mode: last daily bar evaluated (ms)
+    state["trend_pending_entries"] = None
+    state["momentum_last_bar"] = None  # 'momentum' mode: last daily bar evaluated (ms)
+    state["momentum"] = {}            # 'momentum' mode: last_rebalance, targets, pending_buys, snapshot
+    if DRY_RUN:
+        state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
+    return state
+
+
+def atomic_write_json(path, data):
+    """Write JSON to a temp file in the same directory, fsync, then os.replace()."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(prefix='.tmp_', suffix='.json', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        # On Windows os.replace can briefly fail if another thread has the file open.
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 def load_state():
+    state = default_state()
     if not os.path.exists(STATE_FILE):
-        return {"symbol": None, "last_buy_price": 0.0, "peak_price": 0.0}
+        return state
     try:
         with open(STATE_FILE, 'r') as f:
-            return json.load(f)
+            loaded = json.load(f)
+        state.update(loaded or {})
+        if state.get("last_entry_signal") is None:
+            state["last_entry_signal"] = {}
+        if state.get("cooldowns") is None:
+            state["cooldowns"] = {}
+        if state.get("positions") is None:
+            state["positions"] = {}
+        if state.get("momentum") is None:
+            state["momentum"] = {}
+        if DRY_RUN and not state.get("paper"):
+            state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
+        return state
     except Exception as e:
         logging.error(f"Error loading state file: {e}")
-        return {"symbol": None, "last_buy_price": 0.0, "peak_price": 0.0}
+        # Don't silently forget an open position: keep the corrupt file for inspection.
+        raise
+
 
 def save_state(state):
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=4)
+        atomic_write_json(STATE_FILE, state)
     except Exception as e:
         logging.error(f"Error saving state file: {e}")
+        raise
+
 
 def load_ledger():
     if not os.path.exists(LEDGER_FILE):
@@ -94,190 +765,1413 @@ def load_ledger():
         logging.error(f"Error loading trade ledger: {e}")
         return []
 
-def save_trade(trade_type, price, amount, cost):
+
+def save_trade(trade_type, price, amount, cost, symbol=None, fee=None, fee_currency=None,
+               order_id=None, reason=None, pnl=None, partial=False):
     ledger = load_ledger()
-    ledger.append({
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    entry = {
+        "timestamp": fmt_ts(utc_now()),
         "type": trade_type,
+        "symbol": symbol,
         "price": price,
         "amount": amount,
-        "cost": cost
-    })
+        "cost": cost,
+        "fee": fee,
+        "fee_currency": fee_currency,
+        "order_id": order_id,
+        "reason": reason,
+        "partial": partial,
+        "dry_run": DRY_RUN,
+    }
+    if pnl is not None:
+        entry["pnl"] = round(pnl, 6)
+    ledger.append(entry)
     try:
-        with open(LEDGER_FILE, 'w') as f:
-            json.dump(ledger, f, indent=4)
+        atomic_write_json(LEDGER_FILE, ledger)
     except Exception as e:
         logging.error(f"Error saving trade ledger: {e}")
 
-def run_backtest_simulation(symbol):
+
+# =============================================================================
+# Market helpers (precision, minimums)
+# =============================================================================
+def market_base_quote(exchange, symbol):
     try:
-        exchange = get_exchange()
-        since = exchange.parse8601((datetime.utcnow() - timedelta(days=30)).isoformat())
-        candles = exchange.fetch_ohlcv(symbol, timeframe='4h', since=since, limit=200)
-        
-        if not candles or len(candles) < 50:
-            return {"symbol": symbol.split('/')[0], "return_pct": 0.0, "win_rate": 0.0, "trades": 0}
+        m = exchange.market(symbol)
+        return m['base'], m['quote']
+    except Exception:
+        base, quote = symbol.split('/')
+        return base, quote
 
-        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['rsi'] = calculate_rsi(df, period=14)
-        df['ema_50'] = df['close'].ewm(span=50).mean()
-        df.dropna(inplace=True)
 
-        start_cash = 1000.0
-        cash = start_cash
-        asset_held = 0.0
-        trade_amt = 500.0
-        maker_fee = 0.0025
-        trades, wins = 0, 0
-        last_buy_price = 0.0
+def _tick_size(exchange, symbol):
+    p = exchange.market(symbol)['precision'].get('price')
+    if p is None:
+        return None
+    if exchange.precisionMode == ccxt.TICK_SIZE:
+        return float(p)
+    return 10 ** (-int(p))
 
-        for i in range(len(df)):
-            price = df['close'].iat[i]
-            rsi = df['rsi'].iat[i]
-            ema = df['ema_50'].iat[i]
 
-            if asset_held == 0 and rsi < RSI_OVERSOLD and price > ema and cash >= trade_amt:
-                fee = trade_amt * maker_fee
-                asset_held = (trade_amt - fee) / price
-                cash -= trade_amt
-                last_buy_price = price
-                trades += 1
-            elif asset_held > 0 and (price >= last_buy_price * 1.03 or rsi > RSI_OVERBOUGHT):
-                gross_sale = asset_held * price
-                fee = gross_sale * maker_fee
-                net_sale = gross_sale - fee
-                profit = net_sale - trade_amt
-                cash += net_sale
-                if profit > 0:
-                    wins += 1
-                asset_held = 0.0
+def round_price(exchange, symbol, price, side):
+    """price_to_precision, nudged so buys never round UP and sells never round DOWN
+    (keeps post-only orders passive and keeps sells at/above the fee floor)."""
+    p = float(exchange.price_to_precision(symbol, price))
+    tick = _tick_size(exchange, symbol)
+    if tick:
+        if side == 'buy' and p > price * (1 + 1e-12):
+            p = float(exchange.price_to_precision(symbol, p - tick))
+        elif side == 'sell' and p < price * (1 - 1e-12):
+            p = float(exchange.price_to_precision(symbol, p + tick))
+    return p
 
-        final_val = cash + (asset_held * df['close'].iloc[-1])
-        return_pct = ((final_val - start_cash) / start_cash) * 100
-        win_rate = (wins / trades * 100) if trades > 0 else 0.0
 
-        return {
-            "symbol": symbol.split('/')[0],
-            "return_pct": round(return_pct, 2),
-            "win_rate": round(win_rate, 1),
-            "trades": trades
+def round_amount(exchange, symbol, amount):
+    try:
+        return float(exchange.amount_to_precision(symbol, amount))
+    except ccxt.InvalidOrder:
+        return 0.0
+
+
+def check_order_limits(exchange, symbol, amount, price):
+    """Return (ok, message) against the market's minimum amount and cost."""
+    if amount <= 0:
+        return False, "amount rounds to zero"
+    limits = exchange.market(symbol).get('limits') or {}
+    min_amount = (limits.get('amount') or {}).get('min')
+    min_cost = (limits.get('cost') or {}).get('min')
+    if min_amount and amount < min_amount:
+        return False, f"amount {amount} < market minimum {min_amount}"
+    if min_cost and amount * price < min_cost:
+        return False, f"cost {amount * price:.4f} < market minimum cost {min_cost}"
+    return True, ""
+
+
+# =============================================================================
+# Orders: place -> poll until filled -> cancel on timeout -> use actual fill
+# =============================================================================
+Fill = namedtuple('Fill', ['order_id', 'status', 'filled', 'average', 'cost',
+                           'fee', 'fee_currency', 'fee_estimated'])
+
+
+def fill_from_order(order, symbol, exchange, post_only):
+    filled = float(order.get('filled') or 0.0)
+    average = order.get('average')
+    cost = order.get('cost')
+    if filled > 0:
+        if not average:
+            average = (float(cost) / filled) if cost else float(order.get('price') or 0.0)
+        if not cost:
+            cost = filled * float(average)
+    average = float(average or 0.0)
+    cost = float(cost or 0.0)
+
+    fee_cost, fee_currency, estimated = None, None, False
+    fee = order.get('fee')
+    fees = order.get('fees') or ([fee] if fee else [])
+    fees = [f for f in fees if f and f.get('cost') is not None]
+    if fees:
+        fee_currency = fees[0].get('currency')
+        fee_cost = sum(float(f['cost']) for f in fees if f.get('currency') == fee_currency)
+    elif filled > 0:
+        _, quote = market_base_quote(exchange, symbol)
+        fee_cost = cost * (MAKER_FEE if post_only else TAKER_FEE)
+        fee_currency = quote
+        estimated = True
+    return Fill(order.get('id'), order.get('status'), filled, average, cost,
+                fee_cost, fee_currency, estimated)
+
+
+def find_order_by_userref(exchange, symbol, userref):
+    """Locate an order we may have placed (e.g. after a network error on create)."""
+    for fetch in (exchange.fetch_open_orders, exchange.fetch_closed_orders):
+        try:
+            orders = fetch(symbol, params={'userref': userref})
+        except ccxt.BaseError as e:
+            logging.warning(f"Lookup by userref {userref} failed: {e}")
+            continue
+        for o in orders or []:
+            info_ref = (o.get('info') or {}).get('userref')
+            if info_ref is None or str(info_ref) == str(userref):
+                return o
+    return None
+
+
+def wait_for_order(exchange, order_id, symbol, timeout_sec):
+    """Poll until closed/canceled; on timeout cancel and return the FINAL order state.
+    Returns an order dict whose status may still be 'open' if it couldn't be confirmed."""
+    deadline = time.time() + timeout_sec
+    order = None
+    while True:
+        try:
+            order = exchange.fetch_order(order_id, symbol)
+            status = order.get('status')
+            amount = order.get('amount') or 0
+            if status in ('closed', 'canceled', 'expired', 'rejected'):
+                return order
+            if amount and (order.get('filled') or 0) >= amount:
+                return order
+        except ccxt.NetworkError as e:
+            logging.warning(f"fetch_order {order_id} network error: {e}")
+        if time.time() >= deadline:
+            break
+        time.sleep(ORDER_POLL_SEC)
+
+    logging.info(f"Order {order_id} not filled within {timeout_sec}s; cancelling.")
+    for attempt in range(3):
+        try:
+            exchange.cancel_order(order_id, symbol)
+            break
+        except ccxt.OrderNotFound:
+            break   # already closed/canceled - the final fetch below tells us which
+        except ccxt.NetworkError as e:
+            logging.warning(f"cancel_order {order_id} network error (attempt {attempt + 1}): {e}")
+            time.sleep(2 ** attempt)
+        except ccxt.ExchangeError as e:
+            logging.warning(f"cancel_order {order_id} exchange error: {e}")
+            break
+
+    for attempt in range(6):
+        try:
+            order = exchange.fetch_order(order_id, symbol)
+            if order.get('status') != 'open':
+                return order
+        except ccxt.NetworkError as e:
+            logging.warning(f"final fetch_order {order_id} error: {e}")
+        time.sleep(2)
+    return order or {'id': order_id, 'status': 'open', 'filled': 0.0}
+
+
+def execute_order(exchange, state, symbol, side, amount, price, post_only, timeout_sec, meta):
+    """Place a limit order and wait for the result.
+
+    The order is recorded in state['pending_order'] BEFORE it is sent, so a crash or
+    network error never loses track of it. Returns a Fill (filled may be 0), or None
+    if the order's fate is unknown (pending_order is then left in state and resolved
+    on the next loop / at startup). The caller applies the fill, which also clears
+    pending_order in the same atomic state write.
+    """
+    params = {}
+    if post_only:
+        params['postOnly'] = True
+
+    if DRY_RUN:
+        logging.info(f"[DRY RUN] Would place {'post-only ' if post_only else ''}limit {side} "
+                     f"{amount} {symbol} @ {price} (simulating full fill)")
+        cost = amount * price
+        _, quote = market_base_quote(exchange, symbol)
+        return Fill(f"dryrun-{int(time.time() * 1000)}", 'closed', amount, price, cost,
+                    cost * (MAKER_FEE if post_only else TAKER_FEE), quote, True)
+
+    userref = random.randint(1, 2 ** 31 - 1)
+    params['userref'] = userref
+    state["pending_order"] = dict(meta, symbol=symbol, side=side, amount=amount, price=price,
+                                  post_only=post_only, userref=userref, id=None,
+                                  created=utc_now().isoformat())
+    save_state(state)
+
+    logging.info(f"Placing {'post-only ' if post_only else ''}limit {side} {amount} {symbol} @ {price}")
+    try:
+        order = exchange.create_order(symbol, 'limit', side, amount, price, params)
+    except ccxt.NetworkError as e:
+        logging.error(f"Network error creating order (it may or may not exist): {e}")
+        time.sleep(5)
+        order = find_order_by_userref(exchange, symbol, userref)
+        if order is None:
+            logging.error("Order not found yet; leaving it pending to be resolved next loop.")
+            return None
+    except ccxt.ExchangeError as e:
+        # Rejected (e.g. post-only would cross, insufficient funds, below minimum):
+        # nothing was placed, so nothing to record.
+        logging.warning(f"Order rejected by exchange: {e}")
+        state["pending_order"] = None
+        save_state(state)
+        return Fill(None, 'rejected', 0.0, 0.0, 0.0, None, None, False)
+
+    state["pending_order"]["id"] = order['id']
+    save_state(state)
+
+    final = wait_for_order(exchange, order['id'], symbol, timeout_sec)
+    if final.get('status') == 'open':
+        logging.error(f"Order {order['id']} could not be confirmed closed/canceled; "
+                      f"leaving it pending to be resolved next loop.")
+        return None
+    fill = fill_from_order(final, symbol, exchange, post_only)
+    logging.info(f"Order {fill.order_id} final status={fill.status} filled={fill.filled} "
+                 f"avg={fill.average} fee={fill.fee} {fill.fee_currency or ''}")
+    return fill
+
+
+# =============================================================================
+# Applying fills to state + ledger (the only place positions are opened/closed)
+# =============================================================================
+def is_sellable(exchange, symbol, amount, price):
+    ok, _ = check_order_limits(exchange, symbol, round_amount(exchange, symbol, amount), price)
+    return ok
+
+
+def apply_buy_fill(exchange, state, symbol, fill, signal_ts=None, reason="RSI + EMA Setup"):
+    state["pending_order"] = None
+    if fill is None or fill.filled <= 0:
+        save_state(state)
+        return False
+    base, quote = market_base_quote(exchange, symbol)
+    amount_held = fill.filled
+    entry_cost = fill.cost
+    if fill.fee:
+        if fill.fee_currency == base:
+            amount_held -= fill.fee
+        elif fill.fee_currency == quote:
+            entry_cost += fill.fee
+    partial = fill.status != 'closed'
+
+    if DRY_RUN:
+        paper = state.setdefault("paper", {})
+        paper[quote] = paper.get(quote, 0.0) - entry_cost
+        paper[base] = paper.get(base, 0.0) + amount_held
+
+    if signal_ts is not None:
+        state.setdefault("last_entry_signal", {})[symbol] = signal_ts
+
+    if is_sellable(exchange, symbol, amount_held, fill.average):
+        state.update({
+            "symbol": symbol,
+            "last_buy_price": fill.average,
+            "peak_price": fill.average,
+            "amount": amount_held,
+            "entry_time": utc_now().isoformat(),
+            "entry_cost": entry_cost,
+        })
+        opened = True
+    else:
+        logging.warning(f"Buy fill of {amount_held} {base} is below the market minimum (dust); "
+                        f"not opening a tracked position.")
+        opened = False
+    save_state(state)
+    save_trade("BUY", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
+               fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason,
+               partial=partial)
+    return opened
+
+
+def apply_sell_fill(exchange, state, symbol, fill, reason):
+    state["pending_order"] = None
+    if fill is None or fill.filled <= 0:
+        save_state(state)
+        return False
+    base, quote = market_base_quote(exchange, symbol)
+    position_amount = float(state.get("amount") or 0.0)
+    quote_fee = (fill.fee or 0.0) if fill.fee_currency == quote else 0.0
+    proceeds = fill.cost - quote_fee
+    pnl = None
+    if position_amount > 0 and state.get("entry_cost"):
+        basis_per_unit = float(state["entry_cost"]) / position_amount
+        pnl = proceeds - basis_per_unit * fill.filled
+        state["entry_cost"] = float(state["entry_cost"]) - basis_per_unit * fill.filled
+
+    if DRY_RUN:
+        paper = state.setdefault("paper", {})
+        paper[base] = paper.get(base, 0.0) - fill.filled
+        paper[quote] = paper.get(quote, 0.0) + proceeds
+
+    remaining = max(position_amount - fill.filled, 0.0)
+    partial = fill.status != 'closed'
+    if remaining > 0 and is_sellable(exchange, symbol, remaining, fill.average):
+        state["amount"] = remaining
+        logging.info(f"Partial sell: {remaining} {base} still held; will retry exit next loop.")
+        closed = False
+    else:
+        if remaining > 0:
+            logging.warning(f"Remaining {remaining} {base} is below the market minimum (dust); "
+                            f"closing tracked position.")
+        state.update(empty_position())
+        closed = True
+        if STOPLOSS_COOLDOWN_HOURS and str(reason).startswith("Stop-Loss"):
+            until = utc_now() + timedelta(hours=STOPLOSS_COOLDOWN_HOURS)
+            state.setdefault("cooldowns", {})[symbol] = until.isoformat()
+            logging.info(f"Stop-loss on {symbol}: no new entries until {fmt_ts(until)}.")
+    save_state(state)
+    save_trade("SELL", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
+               fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason,
+               pnl=pnl, partial=partial)
+    return closed
+
+
+def _paper_apply(state, base, quote, base_delta, quote_delta):
+    if DRY_RUN:
+        paper = state.setdefault("paper", {})
+        paper[base] = paper.get(base, 0.0) + base_delta
+        paper[quote] = paper.get(quote, 0.0) + quote_delta
+
+
+def apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=None, reason="Trend Breakout", strategy=None):
+    """'trend' / 'momentum' modes: open (or top up) a position in state['positions'] from
+    an actual fill. The position is tagged with the strategy that opened it."""
+    state["pending_order"] = None
+    if fill is None or fill.filled <= 0:
+        save_state(state)
+        return False
+    base, quote = market_base_quote(exchange, symbol)
+    amount, cost = fill.filled, fill.cost
+    if fill.fee:
+        if fill.fee_currency == base:
+            amount -= fill.fee
+        elif fill.fee_currency == quote:
+            cost += fill.fee
+    _paper_apply(state, base, quote, amount, -cost)
+    positions = state.setdefault("positions", {})
+    existing = positions.get(symbol)
+    if existing:                                   # top-up of a held coin (momentum rebalance)
+        existing["amount"] += amount
+        existing["entry_cost"] += cost
+        existing["entry_price"] = existing["entry_cost"] / existing["amount"]
+        opened = True
+    else:
+        opened = is_sellable(exchange, symbol, amount, fill.average)
+    if opened and not existing:
+        positions[symbol] = {
+            "amount": amount, "entry_price": fill.average, "entry_cost": cost,
+            "entry_time": utc_now().isoformat(), "highest_close": fill.average,
+            "stop": trend_initial_stop(fill.average, atr) if (strategy or STRATEGY_MODE) == 'trend' else None,
+            "exit_pending": None, "exit_attempts": 0, "mode": strategy or STRATEGY_MODE,
         }
+    elif not opened:
+        logging.warning(f"Buy fill of {amount} {base} is below the market minimum (dust); not tracked.")
+    save_state(state)
+    save_trade("BUY", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
+               fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason,
+               partial=fill.status != 'closed')
+    return opened
+
+
+def apply_portfolio_sell_fill(exchange, state, symbol, fill, reason):
+    state["pending_order"] = None
+    positions = state.setdefault("positions", {})
+    pos = positions.get(symbol)
+    if fill is None or fill.filled <= 0 or pos is None:
+        save_state(state)
+        return False
+    base, quote = market_base_quote(exchange, symbol)
+    quote_fee = (fill.fee or 0.0) if fill.fee_currency == quote else 0.0
+    proceeds = fill.cost - quote_fee
+    basis_per_unit = pos["entry_cost"] / pos["amount"] if pos["amount"] else 0.0
+    pnl = proceeds - basis_per_unit * fill.filled
+    _paper_apply(state, base, quote, -fill.filled, proceeds)
+    remaining = max(pos["amount"] - fill.filled, 0.0)
+    if remaining > 0 and is_sellable(exchange, symbol, remaining, fill.average):
+        pos["amount"] = remaining
+        pos["entry_cost"] -= basis_per_unit * fill.filled
+        closed = False
+    else:
+        if remaining > 0:
+            logging.warning(f"Remaining {remaining} {base} is dust; closing tracked position.")
+        positions.pop(symbol, None)
+        closed = True
+    save_state(state)
+    save_trade("SELL", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
+               fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason, pnl=pnl,
+               partial=fill.status != 'closed')
+    return closed
+
+
+def resolve_pending_order(exchange, state):
+    """Handle an order left over from a crash / network error. Never records a trade
+    unless the exchange confirms a fill. Returns True if nothing is pending anymore."""
+    pending = state.get("pending_order")
+    if not pending:
+        return True
+    if DRY_RUN:
+        state["pending_order"] = None
+        save_state(state)
+        return True
+
+    symbol = pending["symbol"]
+    logging.warning(f"Resolving pending {pending['side']} order on {symbol}: {pending}")
+    order = None
+    try:
+        if pending.get("id"):
+            order = exchange.fetch_order(pending["id"], symbol)
+        else:
+            order = find_order_by_userref(exchange, symbol, pending["userref"])
+    except ccxt.OrderNotFound:
+        order = None
+
+    if order is None:
+        created = parse_iso(pending.get("created")) or utc_now()
+        if (utc_now() - created).total_seconds() > PENDING_ORDER_GIVE_UP_SEC:
+            logging.warning("Pending order never appeared on the exchange; assuming it was "
+                            "not placed and clearing it.")
+            state["pending_order"] = None
+            save_state(state)
+            return True
+        logging.warning("Pending order not found yet; will retry next loop.")
+        return False
+
+    if order.get('status') == 'open':
+        order = wait_for_order(exchange, order['id'], symbol, 0)  # cancels, then final fetch
+        if order.get('status') == 'open':
+            logging.error(f"Could not cancel pending order {order.get('id')}; will retry.")
+            return False
+
+    fill = fill_from_order(order, symbol, exchange, pending.get("post_only", True))
+    if pending.get("mode") == 'portfolio':
+        if pending["side"] == 'buy':
+            apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=pending.get("atr"),
+                                     reason=pending.get("reason", "Trend Breakout") + " (recovered)",
+                                     strategy=pending.get("strategy", "trend"))
+        else:
+            apply_portfolio_sell_fill(exchange, state, symbol, fill,
+                                      reason=pending.get("reason", "Exit") + " (recovered)")
+        return True
+    if pending["side"] == 'buy':
+        apply_buy_fill(exchange, state, symbol, fill, signal_ts=pending.get("signal_ts"),
+                       reason=pending.get("reason", "RSI + EMA Setup") + " (recovered)")
+    else:
+        apply_sell_fill(exchange, state, symbol, fill,
+                        reason=pending.get("reason", "Exit") + " (recovered)")
+    return True
+
+
+# =============================================================================
+# Balances, reconciliation
+# =============================================================================
+def get_balances(exchange, state):
+    """Return (free, total) balance dicts (paper wallet in DRY_RUN)."""
+    if DRY_RUN:
+        paper = dict(state.get("paper") or {})
+        return paper, paper
+    balance = exchange.fetch_balance()
+    return balance.get('free') or {}, balance.get('total') or {}
+
+
+def reconcile_on_startup(exchange):
+    """Compare state with the exchange before trading; log discrepancies."""
+    state = load_state()
+
+    # Migrate state written by the original bot (no amount / entry_time fields).
+    if state.get("symbol") and not state.get("entry_time"):
+        logging.warning("State has no entry_time (old format); starting the max-hold "
+                        "clock from now.")
+        state["entry_time"] = utc_now().isoformat()
+
+    if DRY_RUN:
+        logging.info(f"[DRY RUN] Paper wallet: {state.get('paper')}; position: "
+                     f"{state.get('symbol')} {state.get('amount')}")
+        state["pending_order"] = None
+        save_state(state)
+        return
+
+    resolve_pending_order(exchange, state)
+
+    open_orders = exchange.fetch_open_orders()
+    stray = [o for o in open_orders if o.get('symbol') in WATCHLIST]
+    for o in stray:
+        logging.warning(f"Open order on watchlist symbol not tracked by bot: {o.get('symbol')} "
+                        f"{o.get('side')} {o.get('amount')} @ {o.get('price')} (id {o.get('id')})")
+        if CANCEL_STRAY_ORDERS_ON_START:
+            try:
+                exchange.cancel_order(o['id'], o['symbol'])
+                logging.warning(f"Cancelled stray order {o['id']}.")
+            except ccxt.BaseError as e:
+                logging.error(f"Failed to cancel stray order {o['id']}: {e}")
+    if stray and not CANCEL_STRAY_ORDERS_ON_START:
+        logging.warning("New entries on those symbols are skipped while their orders stay open.")
+
+    free, total = get_balances(exchange, state)
+    for sym, pos in list((state.get("positions") or {}).items()):
+        base, _ = market_base_quote(exchange, sym)
+        held = float(total.get(base) or 0.0)
+        if held < pos["amount"] * (1 - POSITION_TOLERANCE_PCT):
+            logging.warning(f"Discrepancy: {pos.get('mode', 'trend')} position {sym} {pos['amount']} "
+                            f"but exchange holds {held}.")
+            if held > 0 and is_sellable(exchange, sym, held, pos["entry_price"]):
+                pos["amount"] = held
+            else:
+                logging.error(f"No sellable {base} for {pos.get('mode', 'trend')} position {sym}; removing it from state.")
+                state["positions"].pop(sym)
+    symbol = state.get("symbol")
+    if symbol:
+        base, _ = market_base_quote(exchange, symbol)
+        held_total = float(total.get(base) or 0.0)
+        held_free = float(free.get(base) or 0.0)
+        amount = float(state.get("amount") or 0.0)
+        if amount <= 0:
+            amount = held_free
+            logging.warning(f"State has no position amount (old format); adopting free "
+                            f"{base} balance {amount}.")
+            state["amount"] = amount
+            if not state.get("entry_cost"):
+                state["entry_cost"] = amount * float(state.get("last_buy_price") or 0.0)
+        price = float(state.get("last_buy_price") or 0.0) or 1.0
+        if held_total < amount * (1 - POSITION_TOLERANCE_PCT):
+            logging.warning(f"Discrepancy: state says {amount} {base} but exchange holds "
+                            f"{held_total}. Using the exchange balance.")
+            if held_total > 0 and is_sellable(exchange, symbol, held_total, price):
+                state["amount"] = held_total
+            else:
+                logging.error(f"No sellable {base} balance for the tracked position; "
+                              f"clearing position state.")
+                state.update(empty_position())
+        elif held_total > amount * (1 + POSITION_TOLERANCE_PCT):
+            logging.info(f"Exchange holds {held_total} {base}, more than the tracked "
+                         f"{amount}; the extra is not managed by the bot.")
+    else:
+        for sym in WATCHLIST:
+            base, _ = market_base_quote(exchange, sym)
+            if float(total.get(base) or 0.0) > 0:
+                logging.info(f"Holding {total.get(base)} {base} that is not a tracked "
+                             f"position; the bot will not sell it.")
+    save_state(state)
+    logging.info(f"Reconcile complete. Position: {state.get('symbol')} amount={state.get('amount')}")
+
+
+# =============================================================================
+# Backtest (uses the same entry/exit functions as the live loop)
+# =============================================================================
+def _candle_path(o, h, l, c, steps):
+    """Approximate intra-candle price path (O->L->H->C for up candles, O->H->L->C for
+    down candles), linearly interpolated into ~`steps` points, to mimic the live loop
+    polling every CHECK_INTERVAL_SEC inside each candle."""
+    pts = [o, l, h, c] if c >= o else [o, h, l, c]
+    per_seg = max(1, steps // 3)
+    path = [o]
+    for a, b in zip(pts[:-1], pts[1:]):
+        for k in range(1, per_seg + 1):
+            path.append(a + (b - a) * k / per_seg)
+    return path
+
+
+def simulate_exit_in_candle(pos, o, h, l, c, candle_start_ms, tf_sec, steps, rsi):
+    """Shared backtest exit model for one candle while a position is open.
+
+    pos: dict with entry_price, peak, entry_time (aware datetime); pos['peak'] is updated.
+    Returns (fill_price, fee_rate, decision, exit_time) or None if still holding.
+    Non-urgent exits fill (maker fee) only if price >= decision.min_price, mirroring the
+    fee-floored post-only sell; stop-loss fills at the path price minus slippage with
+    taker fee.
+    """
+    candle_start = datetime.fromtimestamp(candle_start_ms / 1000, tz=timezone.utc)
+    candle_end = candle_start + timedelta(seconds=tf_sec)
+    # Fast path: decide_exit is monotone in price/peak/time, so if neither extreme of
+    # the candle (low with the highest possible peak, or high) at the candle's end
+    # triggers anything, nothing inside the candle can.
+    peak_hi = max(pos['peak'], h)
+    if decide_exit(pos['entry_price'], peak_hi, pos['entry_time'], l, candle_end, rsi=rsi) is None \
+            and decide_exit(pos['entry_price'], peak_hi, pos['entry_time'], h, candle_end, rsi=rsi) is None:
+        pos['peak'] = peak_hi
+        return None
+    path = _candle_path(o, h, l, c, steps)
+    n = len(path) - 1
+    for k, p in enumerate(path):
+        t = candle_start + timedelta(seconds=tf_sec * k / n)
+        pos['peak'] = max(pos['peak'], p)
+        d = decide_exit(pos['entry_price'], pos['peak'], pos['entry_time'], p, t, rsi=rsi)
+        if d is None:
+            continue
+        if d.urgent:
+            return p * (1 - BACKTEST_TAKER_SLIPPAGE_PCT), TAKER_FEE, d, t
+        if d.min_price is not None and p < d.min_price:
+            continue    # fee-floored post-only sell would not fill here
+        return p, MAKER_FEE, d, t
+    return None
+
+
+def backtest_on_dataframe(df, timeframe=TIMEFRAME, start_cash=BACKTEST_START_CASH,
+                          return_trades=False):
+    """Simulate the live strategy on CLOSED candles of one symbol (offline / testable).
+
+    - Entry: entry_signals() on closed candle i -> post-only buy at the open of candle
+      i+1 (maker fee), sized like live (POSITION_SIZE_PCT of cash). One entry per signal
+      candle; no entries during the post-stop-loss cooldown (same rules as live).
+    - Exits: shared decide_exit() via simulate_exit_in_candle().
+    df may already contain indicator columns (optimize.py precomputes them).
+    """
+    if 'rsi' not in df.columns or 'ema_200' not in df.columns:
+        df = add_indicators(df)
+    signal, _ = entry_signals(df)
+    sig = signal.to_numpy()
+    ts = df['timestamp'].to_numpy(dtype='int64')
+    o_, h_, l_, c_ = (df[k].to_numpy(dtype=float) for k in ('open', 'high', 'low', 'close'))
+    rsi_ = df['rsi'].to_numpy(dtype=float)
+    tf_sec = ccxt.Exchange.parse_timeframe(timeframe)
+    steps = max(4, int(tf_sec // CHECK_INTERVAL_SEC))
+    cooldown_ms = int((STOPLOSS_COOLDOWN_HOURS or 0) * 3_600_000)
+
+    cash = start_cash
+    amount = entry_cost = 0.0
+    pos = None
+    cooldown_until = -1
+    trades = wins = 0
+    pnls, trade_log = [], []
+    equity_peak, max_dd = start_cash, 0.0
+
+    for i in range(1, len(ts)):
+        if amount == 0:
+            trade_usd = cash * POSITION_SIZE_PCT
+            if sig[i - 1] and ts[i] >= cooldown_until and trade_usd >= MIN_TRADE_USD:
+                entry_price = o_[i]
+                amount = (trade_usd - trade_usd * MAKER_FEE) / entry_price
+                cash -= trade_usd
+                entry_cost = trade_usd
+                pos = {'entry_price': entry_price, 'peak': entry_price, 'entry_i': i,
+                       'entry_time': datetime.fromtimestamp(ts[i] / 1000, tz=timezone.utc)}
+            else:
+                continue    # flat: equity unchanged
+
+        res = simulate_exit_in_candle(pos, o_[i], h_[i], l_[i], c_[i], ts[i], tf_sec, steps,
+                                      rsi_[i - 1])
+        if res is not None:
+            fill_price, fee_rate, d, t = res
+            gross = amount * fill_price
+            net = gross - gross * fee_rate
+            pnl = net - entry_cost
+            cash += net
+            trades += 1
+            wins += 1 if pnl > 0 else 0
+            pnls.append(pnl)
+            if return_trades:
+                trade_log.append({"entry_ts": int(ts[pos['entry_i']]), "exit_time": t.isoformat(),
+                                  "entry": pos['entry_price'], "exit": fill_price,
+                                  "reason": d.reason, "pnl": pnl, "ret": pnl / entry_cost})
+            if d.urgent and cooldown_ms:
+                cooldown_until = int(t.timestamp() * 1000) + cooldown_ms
+            amount = 0.0
+            pos = None
+        equity = cash + amount * c_[i]
+        equity_peak = max(equity_peak, equity)
+        max_dd = max(max_dd, (equity_peak - equity) / equity_peak)
+
+    final_val = cash + amount * float(c_[-1]) * (1 - MAKER_FEE) if len(ts) else cash
+    days = (ts[-1] - ts[0]) / 86_400_000 if len(ts) > 1 else 0.0
+    out = {
+        "return_pct": round((final_val - start_cash) / start_cash * 100, 2),
+        "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
+        "trades": trades,
+        "open_position": amount > 0,
+        "days": round(float(days), 1),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "pnls": pnls,
+    }
+    if return_trades:
+        out["trade_log"] = trade_log
+    return out
+
+
+def fetch_ohlcv_history(exchange, symbol, timeframe, days):
+    """Paginate fetch_ohlcv forward from `days` ago. Kraken only serves the most
+    recent 720 candles, so for 4h this yields at most ~120 days."""
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    now_ms = exchange.milliseconds()
+    since = now_ms - days * 86_400_000
+    candles = {}
+    for _ in range(20):
+        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=720)
+        if not batch:
+            break
+        new = 0
+        for c in batch:
+            if c[0] not in candles:
+                candles[c[0]] = c
+                new += 1
+        last_ts = batch[-1][0]
+        if new == 0 or last_ts + tf_ms >= now_ms:
+            break
+        since = last_ts + tf_ms
+    rows = [candles[k] for k in sorted(candles) if k >= now_ms - days * 86_400_000]
+    return rows
+
+
+def run_backtest_simulation(symbol):
+    name = symbol.split('/')[0]
+    try:
+        exchange = get_public_exchange()
+        candles = fetch_ohlcv_history(exchange, symbol, TIMEFRAME, BACKTEST_DAYS)
+        df = ohlcv_to_closed_df(candles, TIMEFRAME)
+        if len(df) < EMA_LONG_PERIOD + 10:
+            return {"symbol": name, "return_pct": 0.0, "win_rate": 0.0, "trades": 0, "days": 0}
+        res = backtest_on_dataframe(df, TIMEFRAME)
+        return {"symbol": name, "return_pct": res["return_pct"], "win_rate": res["win_rate"],
+                "trades": res["trades"], "days": res["days"]}
     except Exception as e:
         logging.error(f"Error in backtest simulation for {symbol}: {e}")
-        return {"symbol": symbol.split('/')[0], "return_pct": 0.0, "win_rate": 0.0, "trades": 0}
+        return {"symbol": name, "return_pct": 0.0, "win_rate": 0.0, "trades": 0, "days": 0}
+
+
+def trend_scanner_rows():
+    rows = []
+    ex = get_public_exchange()
+    for sym in WATCHLIST:
+        try:
+            df = fetch_trend_df(ex, sym)
+            r = df.iloc[-1]
+            rows.append({"symbol": sym.split('/')[0], "close": float(r['close']),
+                         "donch_hi": float(r['donch_hi']) if not pd.isna(r['donch_hi']) else 0.0,
+                         "ma": float(r['ma']) if not pd.isna(r['ma']) else 0.0,
+                         "signal": bool(trend_entry_signal(float(r['close']), r['donch_hi'], r['ma']))})
+        except Exception as e:
+            logging.error(f"Trend scanner error for {sym}: {e}")
+    return rows
+
 
 def update_scanner_cache():
-    global scanner_cache
     while True:
+        if STRATEGY_MODE == 'momentum':
+            try:
+                ex = get_public_exchange()
+                scanner_cache["momentum"] = momentum_snapshot(ex)
+                scanner_cache["last_updated"] = fmt_ts(utc_now())
+            except Exception as e:
+                logging.error(f"Error updating momentum scanner: {e}")
+            time.sleep(SCANNER_REFRESH_SEC)
+            continue
+        if STRATEGY_MODE == 'trend':
+            try:
+                scanner_cache["trend_rows"] = trend_scanner_rows()
+                scanner_cache["last_updated"] = fmt_ts(utc_now())
+            except Exception as e:
+                logging.error(f"Error updating trend scanner: {e}")
+            time.sleep(SCANNER_REFRESH_SEC)
+            continue
         try:
             results = [run_backtest_simulation(sym) for sym in WATCHLIST]
             scanner_cache["results"] = sorted(results, key=lambda x: x['return_pct'], reverse=True)
-            scanner_cache["last_updated"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            days = [r["days"] for r in results if r.get("days")]
+            scanner_cache["days"] = int(round(min(days))) if days else BACKTEST_DAYS
+            scanner_cache["last_updated"] = fmt_ts(utc_now())
         except Exception as e:
             logging.error(f"Error updating scanner cache: {e}")
-        time.sleep(3600)
+        time.sleep(SCANNER_REFRESH_SEC)
+
+
+# =============================================================================
+# Live trading loop
+# =============================================================================
+def fetch_closed_indicators(exchange, symbol, return_df=False):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT)
+    df = ohlcv_to_closed_df(ohlcv, TIMEFRAME, exchange.milliseconds())
+    if len(df) < EMA_PERIOD + 1:
+        return None
+    df = add_indicators(df)
+    return df if return_df else df.iloc[-1]   # last CLOSED candle
+
+
+def manage_position(exchange, state, free, total):
+    symbol = state["symbol"]
+    base, _ = market_base_quote(exchange, symbol)
+    entry_price = float(state.get("last_buy_price") or 0.0)
+    position_amount = float(state.get("amount") or 0.0)
+    entry_time = parse_iso(state.get("entry_time"))
+
+    ticker = exchange.fetch_ticker(symbol)
+    current_price = ticker.get('last') or ticker.get('bid')
+
+    held_total = float(total.get(base) or 0.0)
+    if not is_sellable(exchange, symbol, min(held_total, position_amount) or held_total, current_price):
+        logging.error(f"Tracked position {position_amount} {base} but exchange holds "
+                      f"{held_total} (not sellable). Clearing position state.")
+        state.update(empty_position())
+        save_state(state)
+        bot_status["last_action"] = f"Position in {base} no longer on exchange; state cleared."
+        return
+
+    if current_price > float(state.get("peak_price") or 0.0):
+        state["peak_price"] = current_price
+        save_state(state)
+    peak_price = state["peak_price"]
+
+    bot_status["active_symbol"] = symbol
+    bot_status["price"] = current_price
+    bot_status["asset_balance"] = position_amount
+
+    rsi = None
+    if USE_RSI_OVERBOUGHT_EXIT:
+        row = fetch_closed_indicators(exchange, symbol)
+        if row is not None:
+            rsi = float(row['rsi'])
+            bot_status["rsi"] = rsi
+            bot_status["ema_50"] = float(row['ema_50'])
+
+    decision = decide_exit(entry_price, peak_price, entry_time, current_price, utc_now(), rsi=rsi)
+    if decision is None:
+        trail = trailing_stop_price(entry_price, peak_price)
+        armed = TRAIL_PCT is not None and peak_price >= entry_price * (1 + TRAIL_ACTIVATE_PCT)
+        bot_status["last_action"] = (
+            f"Holding {position_amount:g} {base} @ entry ${entry_price:,.4f}. Peak: ${peak_price:,.4f}"
+            + (f", trail stop ${trail:,.4f}" if armed else "")
+        )
+        return
+
+    logging.info(f"Exit signal on {symbol}: {decision.reason} (price {current_price})")
+    attempts = STOP_LOSS_RETRIES if decision.urgent else 1
+    for attempt in range(attempts):
+        sell_amount = min(float(state.get("amount") or 0.0), float(free.get(base) or 0.0))
+        sell_amount = round_amount(exchange, symbol, sell_amount)
+        ticker = exchange.fetch_ticker(symbol) if attempt > 0 else ticker
+        bid = ticker.get('bid') or current_price
+        ask = ticker.get('ask') or current_price
+        if decision.urgent:
+            # Marketable limit (crosses the spread; taker fee) - getting out matters more.
+            price = round_price(exchange, symbol, bid * (1 - STOP_LOSS_MAX_SLIPPAGE_PCT), 'buy')
+            post_only, timeout = False, STOP_LOSS_ORDER_TIMEOUT_SEC
+        else:
+            # Post-only at the ask, never below the fee floor (if one applies).
+            price = max(ask, decision.min_price or 0.0)
+            price = round_price(exchange, symbol, price, 'sell')
+            post_only, timeout = True, ORDER_TIMEOUT_SEC
+
+        ok, msg = check_order_limits(exchange, symbol, sell_amount, price)
+        if not ok:
+            logging.warning(f"Cannot sell {symbol}: {msg} (free {free.get(base)}, tracked "
+                            f"{state.get('amount')})")
+            bot_status["last_action"] = f"Exit blocked for {base}: {msg}"
+            return
+
+        fill = execute_order(exchange, state, symbol, 'sell', sell_amount, price, post_only,
+                             timeout, {"reason": decision.reason})
+        if fill is None:
+            bot_status["last_action"] = f"Sell order on {base} unresolved; will reconcile."
+            return
+        closed = apply_sell_fill(exchange, state, symbol, fill, decision.reason)
+        if fill.filled > 0:
+            bot_status["last_action"] = (f"Sold {fill.filled:g} {base} at ${fill.average:,.4f} "
+                                         f"({decision.reason}){'' if closed else ' - partial'}")
+        else:
+            bot_status["last_action"] = f"Sell on {base} not filled ({decision.reason}); will retry."
+        if closed:
+            return
+        if decision.urgent:
+            free, _ = get_balances(exchange, state)
+
+
+def scan_and_enter(exchange, state, usd_free):
+    blocked = set()
+    if not DRY_RUN:
+        blocked = {o.get('symbol') for o in exchange.fetch_open_orders()
+                   if o.get('symbol') in WATCHLIST}
+        if blocked:
+            logging.warning(f"Skipping entries on symbols with open orders: {sorted(blocked)}")
+
+    best = None
+    now = utc_now()
+    for sym in WATCHLIST:
+        if sym in blocked:
+            continue
+        cd_until = parse_iso((state.get("cooldowns") or {}).get(sym))
+        if cd_until and cd_until > now:
+            logging.info(f"{sym} in post-stop-loss cooldown until {fmt_ts(cd_until)}; skipping.")
+            continue
+        df = fetch_closed_indicators(exchange, sym, return_df=True)
+        if df is None:
+            continue
+        row = df.iloc[-1]
+        signal, score = check_entry_signal(df)
+        signal_ts = int(row['timestamp'])
+        if signal and state.get("last_entry_signal", {}).get(sym) == signal_ts:
+            continue    # already traded this exact signal candle
+        if signal and (best is None or score > best[1]):
+            best = (sym, score, row, signal_ts)
+
+    if best is None:
+        bot_status["active_symbol"] = "None (Scanning Watchlist)"
+        bot_status["last_action"] = "No valid entry setups found. Holding USD."
+        return
+    sym, score, row, signal_ts = best
+    base, _ = market_base_quote(exchange, sym)
+    bot_status["rsi"] = float(row['rsi'])
+    bot_status["ema_50"] = float(row['ema_50'])
+
+    if usd_free < MIN_TRADE_USD:
+        bot_status["last_action"] = f"Setup on {base} but USD balance below ${MIN_TRADE_USD:.2f}."
+        return
+
+    ticker = exchange.fetch_ticker(sym)
+    bid = ticker.get('bid') or ticker.get('last')
+    bot_status["price"] = bid
+    price = round_price(exchange, sym, bid, 'buy')
+    trade_amount_usd = usd_free * POSITION_SIZE_PCT
+    amount = round_amount(exchange, sym, trade_amount_usd / price)
+    ok, msg = check_order_limits(exchange, sym, amount, price)
+    if not ok or amount * price < MIN_TRADE_USD:
+        logging.info(f"Skipping buy on {sym}: {msg or 'below MIN_TRADE_USD'}")
+        bot_status["last_action"] = f"Setup on {base} but order too small: {msg or 'below MIN_TRADE_USD'}"
+        return
+
+    logging.info(f"Executing post-only limit buy on {sym} at RSI {row['rsi']:.1f}: {amount} @ {price}")
+    fill = execute_order(exchange, state, sym, 'buy', amount, price, True, ORDER_TIMEOUT_SEC,
+                         {"reason": "RSI + EMA Setup", "signal_ts": signal_ts})
+    if fill is None:
+        bot_status["last_action"] = f"Buy order on {base} unresolved; will reconcile."
+        return
+    opened = apply_buy_fill(exchange, state, sym, fill, signal_ts=signal_ts)
+    if fill.filled > 0:
+        bot_status["active_symbol"] = sym if opened else bot_status["active_symbol"]
+        bot_status["asset_balance"] = state.get("amount", 0.0)
+        bot_status["last_action"] = (f"Bought {fill.filled:g} {base} for ${fill.cost:,.2f} at "
+                                     f"${fill.average:,.4f}{'' if fill.status == 'closed' else ' (partial fill)'}")
+    else:
+        bot_status["last_action"] = f"Buy on {base} not filled within {ORDER_TIMEOUT_SEC}s; cancelled."
+
+
+# ----------------------------------------------------------------------------- trend mode
+def fetch_trend_df(exchange, symbol):
+    """Closed daily candles with trend indicators (enough history for the 200-day MA)."""
+    bpd = bars_per_day(TREND_TIMEFRAME)
+    need = int(max(TREND_MA_DAYS or 0, TREND_ENTRY_DAYS, TREND_EXIT_DAYS or 0) * bpd) + 60
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TREND_TIMEFRAME, limit=min(720, need))
+    return add_trend_indicators(ohlcv_to_closed_df(ohlcv, TREND_TIMEFRAME, exchange.milliseconds()))
+
+
+def trend_exit(exchange, state, symbol, urgent, reason, free):
+    pos = state["positions"][symbol]
+    base, _ = market_base_quote(exchange, symbol)
+    amount = round_amount(exchange, symbol, min(pos["amount"], float(free.get(base) or 0.0)))
+    ticker = exchange.fetch_ticker(symbol)
+    bid = ticker.get('bid') or ticker.get('last')
+    ask = ticker.get('ask') or ticker.get('last')
+    if urgent:
+        price = round_price(exchange, symbol, bid * (1 - STOP_LOSS_MAX_SLIPPAGE_PCT), 'buy')
+        post_only, timeout = False, STOP_LOSS_ORDER_TIMEOUT_SEC
+    else:
+        price = round_price(exchange, symbol, ask, 'sell')
+        post_only, timeout = True, ORDER_TIMEOUT_SEC
+    ok, msg = check_order_limits(exchange, symbol, amount, price)
+    if not ok:
+        logging.warning(f"Cannot sell {symbol}: {msg}")
+        return False
+    fill = execute_order(exchange, state, symbol, 'sell', amount, price, post_only, timeout,
+                         {"mode": "portfolio", "reason": reason})
+    if fill is None:
+        return False
+    closed = apply_portfolio_sell_fill(exchange, state, symbol, fill, reason)
+    if not closed and symbol in state["positions"]:
+        p = state["positions"][symbol]
+        p["exit_pending"] = reason
+        p["exit_attempts"] = int(p.get("exit_attempts") or 0) + (0 if fill.filled > 0 else 1)
+        save_state(state)
+    if fill.filled > 0:
+        bot_status["last_action"] = f"Sold {fill.filled:g} {base} at ${fill.average:,.4f} ({reason})"
+    return closed
+
+
+def trend_iteration(exchange, state, free, total):
+    """One loop of the multi-position trend strategy.
+
+    Every loop: check ATR trailing stops against the live price (urgent, marketable
+    exit) and retry pending exits/entries. Once per newly closed daily candle: update
+    stops, flag Donchian-low exits and queue breakout entries (strongest first).
+    """
+    positions = state.setdefault("positions", {})
+    bar_ms = ccxt.Exchange.parse_timeframe(TREND_TIMEFRAME) * 1000
+    now_ms = exchange.milliseconds()
+    expected_bar = (now_ms // bar_ms) * bar_ms - bar_ms       # last bar that should be closed
+
+    # 1) intraday ATR stops + pending exits
+    prices = {}
+    for sym in list(positions):
+        ticker = exchange.fetch_ticker(sym)
+        price = ticker.get('last') or ticker.get('bid')
+        prices[sym] = price
+        pos = positions[sym]
+        if trend_stop_hit(price, pos.get("stop")):
+            logging.info(f"ATR stop hit on {sym}: {price} <= {pos['stop']:.6g}")
+            trend_exit(exchange, state, sym, True, f"ATR Stop ({TREND_ATR_MULT}x)", free)
+        elif pos.get("exit_pending"):
+            urgent = int(pos.get("exit_attempts") or 0) >= TREND_EXIT_MAX_ATTEMPTS
+            trend_exit(exchange, state, sym, urgent, pos["exit_pending"], free)
+        free, total = get_balances(exchange, state)
+
+    # 2) once per new daily close: stops, exit signals, entry signals
+    if state.get("trend_last_bar") != expected_bar:
+        rows, btc_ok = {}, True
+        for sym in WATCHLIST:
+            df = fetch_trend_df(exchange, sym)
+            if len(df) and int(df['timestamp'].iloc[-1]) == expected_bar:
+                rows[sym] = df.iloc[-1]
+        if TREND_REGIME_FILTER:
+            bdf = fetch_trend_df(exchange, 'BTC/USD')
+            bclose = bdf['close']
+            bma = bclose.rolling(200 * bars_per_day(TREND_TIMEFRAME)).mean()
+            btc_ok = bool(len(bdf) and bclose.iloc[-1] > bma.iloc[-1])
+        if rows:
+            for sym, pos in positions.items():
+                r = rows.get(sym)
+                if r is None:
+                    continue
+                pos["highest_close"] = max(pos.get("highest_close") or 0.0, float(r['close']))
+                pos["stop"] = trend_update_stop(pos.get("stop"), pos["highest_close"], float(r['atr']))
+                if not pos.get("exit_pending") and trend_exit_signal(float(r['close']), r['donch_lo']):
+                    pos["exit_pending"] = f"Close below {TREND_EXIT_DAYS}-day low"
+                    pos["exit_attempts"] = 0
+            cands = [s for s, r in rows.items() if s not in positions and btc_ok
+                     and trend_entry_signal(float(r['close']), r['donch_hi'], r['ma'])]
+            cands.sort(key=lambda s: trend_entry_strength(float(rows[s]['close']), rows[s]['donch_hi']),
+                       reverse=True)
+            state["trend_pending_entries"] = {
+                "bar": expected_bar, "symbols": cands,
+                "signal": {s: {"close": float(rows[s]['close']), "atr": float(rows[s]['atr'])} for s in cands}}
+            state["trend_last_bar"] = expected_bar
+            save_state(state)
+            logging.info(f"Trend bar {expected_bar}: entry candidates {cands}; "
+                         f"exits pending {[s for s, p in positions.items() if p.get('exit_pending')]}")
+            for sym in [s for s, p in positions.items() if p.get("exit_pending")]:
+                trend_exit(exchange, state, sym, False, positions[sym]["exit_pending"], free)
+                free, total = get_balances(exchange, state)
+        else:
+            logging.info("Latest daily candle not available yet; will retry next loop.")
+
+    # 3) entries queued for the current bar (retried each loop until filled or stale)
+    pend = state.get("trend_pending_entries") or {}
+    if pend.get("bar") == expected_bar and pend.get("symbols"):
+        blocked = set()
+        if not DRY_RUN:
+            blocked = {o.get('symbol') for o in exchange.fetch_open_orders()}
+        for sym in list(pend["symbols"]):
+            if len(positions) >= TREND_MAX_POSITIONS:
+                break
+            if sym in positions or sym in blocked:
+                continue
+            free, total = get_balances(exchange, state)
+            usd_free = float(free.get('USD') or 0.0)
+            equity = float(total.get('USD') or 0.0) + sum(
+                p["amount"] * (prices.get(s) or p["entry_price"]) for s, p in positions.items())
+            ticker = exchange.fetch_ticker(sym)
+            bid = ticker.get('bid') or ticker.get('last')
+            sig = pend["signal"][sym]
+            if bid > sig["close"] * (1 + TREND_MAX_ENTRY_CHASE_PCT):
+                logging.info(f"Skipping {sym}: bid {bid} ran more than {TREND_MAX_ENTRY_CHASE_PCT:.0%} "
+                             f"above the signal close {sig['close']}")
+                pend["symbols"].remove(sym)
+                continue
+            usd = min(equity * POSITION_SIZE_PCT / TREND_MAX_POSITIONS, usd_free * 0.99)
+            price = round_price(exchange, sym, bid, 'buy')
+            amount = round_amount(exchange, sym, usd / price) if price else 0.0
+            ok, msg = check_order_limits(exchange, sym, amount, price)
+            if not ok or amount * price < MIN_TRADE_USD:
+                logging.info(f"Skipping trend entry on {sym}: {msg or 'below MIN_TRADE_USD'}")
+                pend["symbols"].remove(sym)
+                continue
+            fill = execute_order(exchange, state, sym, 'buy', amount, price, True, ORDER_TIMEOUT_SEC,
+                                 {"mode": "portfolio", "strategy": "trend", "reason": "Trend Breakout", "atr": sig["atr"]})
+            if fill is None:
+                break                                   # unresolved order: reconcile first
+            apply_portfolio_buy_fill(exchange, state, sym, fill, atr=sig["atr"], strategy='trend')
+            if fill.filled > 0:
+                pend["symbols"].remove(sym)
+                bot_status["last_action"] = f"Bought {fill.filled:g} {sym.split('/')[0]} at ${fill.average:,.4f} (Trend Breakout)"
+        save_state(state)
+
+    # dashboard
+    held = sorted(positions)
+    bot_status["active_symbol"] = (", ".join(s.split('/')[0] for s in held) + f" ({len(held)}/{TREND_MAX_POSITIONS})"
+                                   if held else "None (Trend Watch)")
+    bot_status["asset_balance"] = float(len(held))
+    bot_status["positions"] = [dict(symbol=s, amount=p["amount"], entry=p["entry_price"],
+                                    stop=p.get("stop"), exit_pending=p.get("exit_pending")) for s, p in
+                               sorted(positions.items())]
+    if not held and not (pend.get("symbols")):
+        bot_status["last_action"] = "No trend breakouts. Holding USD."
+
+
+# ----------------------------------------------------------------------------- momentum mode
+DAY_MS = 86_400_000
+
+
+def momentum_backtest_params():
+    """The live MOMENTUM_* settings as a portfolio_backtest.momentum_sim parameter dict
+    (used by optimize.py to check that the backtest matches the live configuration)."""
+    lbs = tuple(MOMENTUM_LOOKBACKS)
+    return dict(lookback_days='cons' if len(lbs) == 3 else lbs[0], top_k=MOMENTUM_TOP_K,
+                rebalance_days=MOMENTUM_REBALANCE_DAYS, abs_filter=MOMENTUM_ABS_FILTER,
+                regime=MOMENTUM_REGIME_FILTER, vol_target=MOMENTUM_VOL_TARGET, breadth=0,
+                exposure=MOMENTUM_EXPOSURE, max_weight=MOMENTUM_MAX_WEIGHT,
+                drift=MOMENTUM_REBALANCE_DRIFT, trim=False, max_invested=MOMENTUM_MAX_INVESTED)
+
+
+def fetch_daily_df(exchange, symbol):
+    need = max(MOMENTUM_REGIME_MA_DAYS, max(MOMENTUM_LOOKBACKS), MOMENTUM_VOL_DAYS) + 40
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=min(720, need))
+    return ohlcv_to_closed_df(ohlcv, '1d', exchange.milliseconds())
+
+
+def momentum_snapshot(exchange, expected_bar=None):
+    """Rank the watchlist on the last closed daily candle with the shared helpers.
+    Coins whose latest candle isn't the expected bar are treated as missing (NaN).
+    regime_ok is None when the BTC candle needed for the regime filter is not available."""
+    syms = list(WATCHLIST)
+    dfs = {}
+    for sym in dict.fromkeys(syms + (['BTC/USD'] if MOMENTUM_REGIME_FILTER else [])):
+        try:
+            df = fetch_daily_df(exchange, sym)
+        except ccxt.BaseError as e:
+            logging.warning(f"Momentum: no daily candles for {sym}: {e}")
+            continue
+        if len(df) and (expected_bar is None or int(df['timestamp'].iloc[-1]) == expected_bar):
+            dfs[sym] = df
+    rets = np.full((len(MOMENTUM_LOOKBACKS), len(syms)), np.nan)
+    vols, closes = np.full(len(syms), np.nan), np.full(len(syms), np.nan)
+    for j, sym in enumerate(syms):
+        if sym in dfs:
+            c = dfs[sym]['close'].astype(float)
+            for i, d in enumerate(MOMENTUM_LOOKBACKS):
+                rets[i, j] = float(momentum_returns(c, d).iloc[-1])
+            vols[j] = float(momentum_volatility(c, MOMENTUM_VOL_DAYS).iloc[-1])
+            closes[j] = float(c.iloc[-1])
+    regime_ok, btc_close, btc_ma = True, None, None
+    if MOMENTUM_REGIME_FILTER:
+        b = dfs.get('BTC/USD')
+        if b is None:
+            regime_ok = None
+        else:
+            bc = b['close'].astype(float)
+            n = MOMENTUM_REGIME_MA_DAYS
+            btc_close, btc_ma = float(bc.iloc[-1]), float(bc.rolling(n, min_periods=n).mean().iloc[-1])
+            regime_ok = bool(sma_regime(bc, n).iloc[-1])
+    picks = momentum_select(list(rets), bool(regime_ok), MOMENTUM_TOP_K, MOMENTUM_ABS_FILTER)
+    ranked = momentum_select(list(rets), True, len(syms), False)       # display order only
+    weights = {syms[j]: float(momentum_weight(MOMENTUM_TOP_K, vols[j], MOMENTUM_VOL_TARGET, MOMENTUM_MAX_WEIGHT,
+                                              MOMENTUM_EXPOSURE)) for j in picks}
+    rows = []
+    for j, sym in enumerate(syms):
+        top = sum(1 for i in range(len(MOMENTUM_LOOKBACKS)) if np.isfinite(rets[i, j]) and
+                  int((rets[i] > rets[i, j]).sum()) < MOMENTUM_TOP_K)
+        rows.append({"symbol": sym, "close": None if np.isnan(closes[j]) else closes[j],
+                     "rets": [None if np.isnan(x) else round(100 * x, 2) for x in rets[:, j]],
+                     "vol": None if np.isnan(vols[j]) else round(100 * vols[j], 1), "votes": top,
+                     "rank": ranked.index(j) + 1 if j in ranked else None,
+                     "selected": j in picks, "weight": round(100 * weights.get(sym, 0.0), 1)})
+    rows.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0))
+    return {"bar": int(expected_bar) if expected_bar is not None else None, "rows": rows,
+            "targets": [syms[j] for j in picks], "weights": weights, "regime_ok": regime_ok,
+            "btc_close": btc_close, "btc_ma": btc_ma, "missing": [s for s in syms if s not in dfs]}
+
+
+def _equity_and_values(exchange, state, total, prices=None):
+    prices = dict(prices or {})
+    values = {}
+    for sym, pos in (state.get("positions") or {}).items():
+        if sym not in prices:
+            t = exchange.fetch_ticker(sym)
+            prices[sym] = t.get('last') or t.get('bid')
+        values[sym] = pos["amount"] * (prices[sym] or pos["entry_price"])
+    return float(total.get('USD') or 0.0) + sum(values.values()), values, prices
+
+
+def momentum_iteration(exchange, state, free, total):
+    """One loop of the momentum rotation.
+
+    Every loop: retry pending exits (post-only, marketable limit after
+    MOMENTUM_ORDER_MAX_ATTEMPTS) and, once no exit is pending, queued buys (same retry
+    rule). Once per newly closed daily candle: recompute ranks; on a rebalance day (every
+    MOMENTUM_REBALANCE_DAYS) or when the BTC regime turns off, flag exits for coins that
+    are no longer targets and queue buys for new targets.
+    """
+    positions = state.setdefault("positions", {})
+    mom = state.setdefault("momentum", {})
+    expected_bar = (exchange.milliseconds() // DAY_MS) * DAY_MS - DAY_MS
+
+    # 1) pending exits
+    for sym in [s for s, p in positions.items() if p.get("exit_pending")]:
+        pos = positions[sym]
+        urgent = int(pos.get("exit_attempts") or 0) >= MOMENTUM_ORDER_MAX_ATTEMPTS
+        trend_exit(exchange, state, sym, urgent, pos["exit_pending"], free)
+        free, total = get_balances(exchange, state)
+
+    # 2) once per new daily close
+    if state.get("momentum_last_bar") != expected_bar:
+        snap = momentum_snapshot(exchange, expected_bar)
+        waited = (exchange.milliseconds() - (expected_bar + DAY_MS)) / 1000
+        if snap["regime_ok"] is None:
+            logging.info("Momentum: BTC daily candle not available yet; will retry next loop.")
+        elif snap["missing"] and waited < MOMENTUM_DATA_GRACE_SEC:
+            logging.info(f"Momentum: waiting for daily candles of {snap['missing']}; will retry next loop.")
+        else:
+            last = mom.get("last_rebalance")
+            due = last is None or expected_bar - int(last) >= MOMENTUM_REBALANCE_DAYS * DAY_MS
+            regime_off = MOMENTUM_REGIME_FILTER and not snap["regime_ok"]
+            if due or (regime_off and (positions or mom.get("pending_buys"))):
+                targets = snap["targets"]
+                why = f"BTC below {MOMENTUM_REGIME_MA_DAYS}-day MA" if regime_off else "Rotated out"
+                for sym in momentum_exits(list(positions), targets):
+                    if not positions[sym].get("exit_pending"):
+                        positions[sym]["exit_pending"] = why
+                        positions[sym]["exit_attempts"] = 0
+                mom["pending_buys"] = {s: {"weight": snap["weights"][s],
+                                           "close": next(r["close"] for r in snap["rows"] if r["symbol"] == s),
+                                           "attempts": 0} for s in targets}
+                mom["targets"] = targets
+                if due:
+                    mom["last_rebalance"] = expected_bar
+                logging.info(f"Momentum rebalance ({'scheduled' if due else 'regime off'}) bar {expected_bar}: "
+                             f"targets {targets}, weights { {k: round(v, 3) for k, v in snap['weights'].items()} }, "
+                             f"exits {[s for s, p in positions.items() if p.get('exit_pending')]}")
+            if snap["missing"]:
+                logging.warning(f"Momentum: no fresh daily candle for {snap['missing']} (excluded this bar).")
+            mom["snapshot"] = snap
+            state["momentum_last_bar"] = expected_bar
+            save_state(state)
+            for sym in [s for s, p in positions.items() if p.get("exit_pending")]:
+                trend_exit(exchange, state, sym, False, positions[sym]["exit_pending"], free)
+                free, total = get_balances(exchange, state)
+
+    # 3) queued buys, only after every exit has gone through (they need the USD)
+    pend = mom.get("pending_buys") or {}
+    if pend and not any(p.get("exit_pending") for p in positions.values()):
+        blocked = set() if DRY_RUN else {o.get('symbol') for o in exchange.fetch_open_orders()}
+        for sym in list(pend):
+            if sym in blocked:
+                continue
+            free, total = get_balances(exchange, state)
+            equity, values, _ = _equity_and_values(exchange, state, total)
+            order_usd = momentum_buys(values, list(pend), {s: q["weight"] for s, q in pend.items()}, equity,
+                                      MOMENTUM_REBALANCE_DRIFT, MIN_TRADE_USD, trim=False,
+                                      max_invested=MOMENTUM_MAX_INVESTED).get(sym)
+            if not order_usd or order_usd <= 0:
+                pend.pop(sym)                    # already held within the drift band, or too small
+                continue
+            q = pend[sym]
+            ticker = exchange.fetch_ticker(sym)
+            bid = ticker.get('bid') or ticker.get('last')
+            ask = ticker.get('ask') or ticker.get('last')
+            cap = q["close"] * (1 + MOMENTUM_MAX_ENTRY_CHASE_PCT)
+            if bid > cap:
+                logging.info(f"Momentum: skipping {sym}; bid {bid} ran more than "
+                             f"{MOMENTUM_MAX_ENTRY_CHASE_PCT:.0%} above the signal close {q['close']}")
+                pend.pop(sym)
+                continue
+            post_only = int(q.get("attempts") or 0) < MOMENTUM_ORDER_MAX_ATTEMPTS
+            raw = bid if post_only else min(ask * (1 + STOP_LOSS_MAX_SLIPPAGE_PCT), cap)
+            price = round_price(exchange, sym, raw, 'buy' if post_only else 'sell')
+            usd = min(order_usd, float(free.get('USD') or 0.0) * 0.99)
+            amount = round_amount(exchange, sym, usd / price) if price else 0.0
+            ok, msg = check_order_limits(exchange, sym, amount, price)
+            if not ok or amount * price < MIN_TRADE_USD:
+                logging.info(f"Momentum: skipping buy of {sym}: {msg or 'below MIN_TRADE_USD'}")
+                pend.pop(sym)
+                continue
+            fill = execute_order(exchange, state, sym, 'buy', amount, price, post_only,
+                                 ORDER_TIMEOUT_SEC if post_only else STOP_LOSS_ORDER_TIMEOUT_SEC,
+                                 {"mode": "portfolio", "strategy": "momentum", "reason": "Momentum Rotation"})
+            if fill is None:
+                break                                    # unresolved order: reconcile first
+            apply_portfolio_buy_fill(exchange, state, sym, fill, reason="Momentum Rotation", strategy='momentum')
+            if fill.filled > 0:
+                pend.pop(sym, None)
+                bot_status["last_action"] = (f"Bought {fill.filled:g} {sym.split('/')[0]} at "
+                                             f"${fill.average:,.4f} (Momentum Rotation)")
+            else:
+                q["attempts"] = int(q.get("attempts") or 0) + 1
+        mom["pending_buys"] = pend
+        save_state(state)
+
+    # dashboard
+    snap = mom.get("snapshot") or {}
+    held = sorted(positions)
+    nxt = (int(mom["last_rebalance"]) + (MOMENTUM_REBALANCE_DAYS + 1) * DAY_MS) if mom.get("last_rebalance") else None
+    bot_status["active_symbol"] = ", ".join(s.split('/')[0] for s in held) if held else "None (USD)"
+    bot_status["asset_balance"] = float(len(held))
+    bot_status["positions"] = [dict(symbol=s, amount=p["amount"], entry=p["entry_price"], stop=None,
+                                    exit_pending=p.get("exit_pending")) for s, p in sorted(positions.items())]
+    bot_status["momentum"] = dict(snap, held=held, pending_buys=sorted(pend),
+                                  next_rebalance=fmt_ts(datetime.fromtimestamp(nxt / 1000, timezone.utc)) if nxt else "next daily close")
+    if not held and not pend:
+        bot_status["last_action"] = ("BTC below its 200-day MA: holding USD." if snap.get("regime_ok") is False
+                                     else "No momentum targets: holding USD.")
+
+
+def trading_iteration(exchange):
+    state = load_state()
+    free, total = get_balances(exchange, state)
+    usd_free = float(free.get('USD') or 0.0)
+    bot_status["usd_balance"] = usd_free
+    bot_status["last_check"] = fmt_ts(utc_now())
+    if state.get("pending_order"):
+        if not resolve_pending_order(exchange, state):
+            bot_status["last_action"] = "Waiting to resolve a pending order..."
+            return
+        free, total = get_balances(exchange, state)
+        usd_free = float(free.get('USD') or 0.0)
+
+    positions = state.get("positions") or {}
+    foreign = sorted(s for s, p in positions.items() if p.get("mode", "trend") != STRATEGY_MODE)
+    if STRATEGY_MODE in ('trend', 'momentum'):
+        if state.get("symbol"):
+            logging.error(f"State holds an RSI-mode position in {state['symbol']} but the preset is "
+                          f"'{STRATEGY_MODE}'. Not trading until it is closed or the preset is switched back.")
+            bot_status["last_action"] = f"Blocked: RSI-mode position open while preset is '{STRATEGY_MODE}'."
+            return
+        if foreign:
+            modes = sorted({positions[s].get("mode", "trend") for s in foreign})
+            logging.error(f"State holds {'/'.join(modes)}-mode positions {foreign} but the preset is "
+                          f"'{STRATEGY_MODE}'. Not trading until they are closed or the preset is switched back.")
+            bot_status["last_action"] = (f"Blocked: {'/'.join(modes)} positions open while preset is "
+                                         f"'{STRATEGY_MODE}'.")
+            return
+        if STRATEGY_MODE == 'trend':
+            trend_iteration(exchange, state, free, total)
+        else:
+            momentum_iteration(exchange, state, free, total)
+    elif positions:
+        modes = sorted({p.get("mode", "trend") for p in positions.values()})
+        logging.error(f"State holds {'/'.join(modes)}-mode positions {sorted(positions)} but the preset is "
+                      f"'{STRATEGY_PRESET}'. Not trading until they are closed or the preset is switched back.")
+        bot_status["last_action"] = f"Blocked: {'/'.join(modes)} positions open while preset is not '{modes[0]}'."
+        return
+    elif state.get("symbol"):
+        manage_position(exchange, state, free, total)
+    else:
+        bot_status["asset_balance"] = 0.0
+        scan_and_enter(exchange, state, usd_free)
+
+    # refresh balance shown on the dashboard after any trade
+    free, _ = get_balances(exchange, load_state())
+    bot_status["usd_balance"] = float(free.get('USD') or 0.0)
+    bot_status["last_check"] = fmt_ts(utc_now())
+
 
 def run_trading_bot():
-    global bot_status
-    logging.info("Starting multi-asset rotation trading bot loop...")
-    
+    logging.info(f"Starting multi-asset rotation trading bot loop... "
+                 f"({'DRY RUN - no real orders' if DRY_RUN else 'LIVE TRADING'}; "
+                 f"preset '{STRATEGY_PRESET}': {strategy_description()}; watchlist {WATCHLIST})")
+    if not DRY_RUN and not (os.getenv("KRAKEN_API_KEY") and os.getenv("KRAKEN_SECRET_KEY")):
+        logging.error("KRAKEN_API_KEY / KRAKEN_SECRET_KEY not set. Set them, or run with "
+                      "DRY_RUN=true to paper trade. Trading loop not started.")
+        bot_status["last_action"] = "Error: API keys missing (set DRY_RUN=true to paper trade)"
+        return
+
+    exchange = get_exchange()
+    backoff = 0
+    ready = False
     while True:
+        sleep_for = CHECK_INTERVAL_SEC
         try:
-            exchange = get_exchange()
-            balance = exchange.fetch_balance()
-            usd_free = balance['free'].get('USD', 0)
-            
-            state = load_state()
-            active_symbol = state.get("symbol")
-            last_buy_price = state.get("last_buy_price", 0.0)
-            peak_price = state.get("peak_price", 0.0)
-            
-            if active_symbol:
-                base_currency = active_symbol.split('/')[0]
-                asset_free = balance['free'].get(base_currency, 0)
-                ticker = exchange.fetch_ticker(active_symbol)
-                current_price = ticker['last']
-                
-                if current_price > peak_price:
-                    peak_price = current_price
-                    state["peak_price"] = peak_price
-                    save_state(state)
-                
-                bot_status["active_symbol"] = active_symbol
-                bot_status["price"] = current_price
-                bot_status["asset_balance"] = asset_free
-                
-                target_price = last_buy_price * 1.03
-                trailing_stop_trigger = last_buy_price * 1.015
-                is_trailing_active = current_price >= trailing_stop_trigger
-                trailing_stop_price = peak_price * 0.99
-                
-                sell_condition = (current_price >= target_price) or (is_trailing_active and current_price <= trailing_stop_price)
-                
-                if asset_free * current_price >= 10.0 and sell_condition:
-                    reason = "3% Target Hit" if current_price >= target_price else "Trailing Stop Triggered"
-                    logging.info(f"Executing Limit Sell on {active_symbol} due to: {reason}")
-                    
-                    order = exchange.create_limit_sell_order(active_symbol, asset_free, current_price)
-                    save_trade("SELL", current_price, asset_free, asset_free * current_price)
-                    
-                    save_state({"symbol": None, "last_buy_price": 0.0, "peak_price": 0.0})
-                    bot_status["last_action"] = f"Sold {base_currency} at ${current_price:,.2f} ({reason})"
-                else:
-                    bot_status["last_action"] = f"Holding {base_currency}. Peak: ${peak_price:,.2f}"
-                
-                time.sleep(CHECK_INTERVAL_SEC)
-                continue
-
-            best_symbol = None
-            best_score = -999
-            target_data = None
-            
-            for sym in WATCHLIST:
-                ohlcv = exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=100)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['rsi'] = calculate_rsi(df, period=14)
-                df['ema_50'] = df['close'].ewm(span=50).mean()
-                df.dropna(inplace=True)
-                
-                current_price = df['close'].iloc[-1]
-                current_rsi = df['rsi'].iloc[-1]
-                ema_50 = df['ema_50'].iloc[-1]
-                
-                if current_rsi < RSI_OVERSOLD and current_price > ema_50:
-                    score = (RSI_OVERSOLD - current_rsi)
-                    if score > best_score:
-                        best_score = score
-                        best_symbol = sym
-                        target_data = (df, current_price, current_rsi, ema_50)
-
-            if best_symbol and usd_free >= 10.0:
-                df, current_price, current_rsi, ema_50 = target_data
-                trade_amount_usd = usd_free * 0.80
-                base_currency = best_symbol.split('/')[0]
-                
-                asset_to_buy = trade_amount_usd / current_price
-                logging.info(f"Executing Limit Buy on {best_symbol} at RSI {current_rsi:.1f}")
-                
-                order = exchange.create_limit_buy_order(best_symbol, asset_to_buy, current_price)
-                save_trade("BUY", current_price, asset_to_buy, trade_amount_usd)
-                
-                save_state({"symbol": best_symbol, "last_buy_price": current_price, "peak_price": current_price})
-                bot_status["active_symbol"] = best_symbol
-                bot_status["last_action"] = f"Bought {base_currency} with ${trade_amount_usd:,.2f} at ${current_price:,.2f}"
-            else:
-                bot_status["active_symbol"] = "None (Scanning Watchlist)"
-                bot_status["last_action"] = "No valid EMA + RSI setups found. Holding USD."
-
-            bot_status["last_check"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            bot_status["usd_balance"] = usd_free
-
+            if not ready:
+                ensure_markets(exchange)
+                reconcile_on_startup(exchange)
+                ready = True
+            trading_iteration(exchange)
+            backoff = 0
+        except ccxt.NetworkError as e:
+            backoff = min(max(30, backoff * 2), CHECK_INTERVAL_SEC)
+            sleep_for = backoff
+            logging.warning(f"Network error: {e}. Retrying in {backoff}s.")
+            bot_status["last_action"] = f"Network error (retrying in {backoff}s): {e}"
+        except ccxt.AuthenticationError as e:
+            logging.error(f"Authentication error - check API keys/permissions: {e}")
+            bot_status["last_action"] = f"Authentication error: {e}"
+        except ccxt.ExchangeError as e:
+            backoff = min(max(60, backoff * 2), CHECK_INTERVAL_SEC)
+            sleep_for = backoff if not ready else CHECK_INTERVAL_SEC
+            logging.error(f"Exchange error: {e}")
+            bot_status["last_action"] = f"Exchange error: {e}"
         except Exception as e:
             logging.exception(f"Critical error in trading bot loop: {e}")
             bot_status["last_action"] = f"Error: {e}"
-        
-        time.sleep(CHECK_INTERVAL_SEC)
+        time.sleep(sleep_for)
 
+
+# =============================================================================
+# Dashboard
+# =============================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -298,13 +2192,13 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>Kraken Advanced Bot Dashboard</h1>
+    <h1>Kraken Advanced Bot Dashboard{% if dry_run %} <span style="color:#f0ad4e;">(DRY RUN)</span>{% endif %}</h1>
     
     <div class="card">
         <h2>Active Status & Portfolio</h2>
         <div class="grid">
             <div class="metric"><h3>Active Symbol</h3><p>{{ status.active_symbol }}</p></div>
-            <div class="metric"><h3>Current Price</h3><p>${{ "%.2f"|format(status.price) }}</p></div>
+            <div class="metric"><h3>Current Price</h3><p>${{ "%.4f"|format(status.price or 0) if (status.price or 0) < 1 else "%.2f"|format(status.price) }}</p></div>
             <div class="metric"><h3>USD Balance</h3><p>${{ "%.2f"|format(status.usd_balance) }}</p></div>
             <div class="metric"><h3>Asset Balance</h3><p>{{ "%.4f"|format(status.asset_balance) }}</p></div>
         </div>
@@ -313,9 +2207,39 @@ HTML_TEMPLATE = """
 
     <div class="card">
         <h2>Multi-Asset Rotation Scanner</h2>
-        <p style="font-size: 13px; color: #aaa;">Simulates 30-day performance using the 50 EMA Trend Filter and RSI rules. (Updated: {{ scanner.last_updated }})</p>
+        <p style="font-size: 13px; color: #aaa;">Simulates ~{{ scanner.days }}-day performance of the live strategy ({{ timeframe }} candles: {{ strategy }}), including Kraken fees. (Updated: {{ scanner.last_updated }})</p>
+        {% if mode == 'momentum' %}
+        {% set m = status.momentum or scanner.momentum or {} %}
+        <p>BTC regime: {% if m.regime_ok %}<span style="color:#28a745;">ON</span> (BTC {{ "%.0f"|format(m.btc_close or 0) }} &gt; 200d MA {{ "%.0f"|format(m.btc_ma or 0) }}){% elif m.regime_ok is sameas false %}<span style="color:#dc3545;">OFF - holding USD</span> (BTC {{ "%.0f"|format(m.btc_close or 0) }} &lt; 200d MA {{ "%.0f"|format(m.btc_ma or 0) }}){% else %}unknown{% endif %}
+           | Targets: {{ (m.targets or [])|join(', ') or 'none' }} | Holdings: {{ (m.held or [])|join(', ') or 'none' }}
+           | Next rebalance: {{ m.next_rebalance or 'after the next daily close' }}{% if m.pending_buys %} | Queued buys: {{ m.pending_buys|join(', ') }}{% endif %}</p>
         <table>
-            <tr><th>Asset</th><th>30-Day Return</th><th>Win Rate</th><th>Trades Executed</th></tr>
+            <tr><th>Rank</th><th>Asset</th>{% for d in lookbacks %}<th>{{ d }}d Return</th>{% endfor %}<th>Top-{{ top_k }} Votes</th><th>30d Vol (ann.)</th><th>Target Weight</th></tr>
+            {% for r in m.rows or [] %}
+            <tr>
+                <td>{{ r.rank or '-' }}</td>
+                <td style="font-weight:bold; color: {{ '#28a745' if r.selected else '#00adb5' }};">{{ r.symbol.split('/')[0] }}{% if r.symbol in (m.held or []) %} (held){% endif %}</td>
+                {% for x in r.rets %}<td style="color: {{ '#28a745' if (x or 0) > 0 else '#dc3545' }};">{{ '%.1f%%'|format(x) if x is not none else '-' }}</td>{% endfor %}
+                <td>{{ r.votes }}/{{ lookbacks|length }}</td>
+                <td>{{ '%.0f%%'|format(r.vol) if r.vol is not none else '-' }}</td>
+                <td style="font-weight:bold;">{{ '%.1f%%'|format(r.weight) if r.selected else '-' }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% elif mode == 'trend' %}
+        <table>
+            <tr><th>Asset</th><th>Last Daily Close</th><th>Prior High (entry level)</th><th>Long MA</th><th>Breakout Signal</th></tr>
+            {% for r in scanner.trend_rows or [] %}
+            <tr>
+                <td style="font-weight:bold; color: #00adb5;">{{ r.symbol }}</td>
+                <td>{{ "%.4f"|format(r.close) }}</td><td>{{ "%.4f"|format(r.donch_hi) }}</td><td>{{ "%.4f"|format(r.ma) }}</td>
+                <td style="color: {{ '#28a745' if r.signal else '#aaa' }}; font-weight:bold;">{{ 'YES' if r.signal else 'no' }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <table>
+            <tr><th>Asset</th><th>{{ scanner.days }}-Day Return</th><th>Win Rate</th><th>Trades Executed</th></tr>
             {% for item in scanner.results %}
             <tr>
                 <td style="font-weight:bold; color: #00adb5;">{{ item.symbol }}</td>
@@ -325,7 +2249,21 @@ HTML_TEMPLATE = """
             </tr>
             {% endfor %}
         </table>
+        {% endif %}
     </div>
+
+    {% if status.positions %}
+    <div class="card">
+        <h2>Open Positions</h2>
+        <table>
+            <tr><th>Asset</th><th>Amount</th><th>Entry</th><th>Trailing Stop</th><th>Pending Exit</th></tr>
+            {% for p in status.positions %}
+            <tr><td style="font-weight:bold; color: #00adb5;">{{ p.symbol }}</td><td>{{ "%.6f"|format(p.amount) }}</td>
+                <td>{{ "%.4f"|format(p.entry) }}</td><td>{{ "%.4f"|format(p.stop) if p.stop else '-' }}</td><td>{{ p.exit_pending or '-' }}</td></tr>
+            {% endfor %}
+        </table>
+    </div>
+    {% endif %}
 
     <div class="card">
         <h2>Recent Trade Ledger</h2>
@@ -334,8 +2272,8 @@ HTML_TEMPLATE = """
             {% for trade in trades %}
             <tr>
                 <td>{{ trade.timestamp }}</td>
-                <td style="color: {{ '#28a745' if trade.type == 'BUY' else '#dc3545' }}; font-weight:bold;">{{ trade.type }}</td>
-                <td>${{ "%.2f"|format(trade.price) }}</td>
+                <td style="color: {{ '#28a745' if trade.type == 'BUY' else '#dc3545' }}; font-weight:bold;">{{ trade.type }}{% if trade.symbol %} {{ trade.symbol.split('/')[0] }}{% endif %}</td>
+                <td>${{ "%.4f"|format(trade.price) if trade.price < 1 else "%.2f"|format(trade.price) }}</td>
                 <td>{{ "%.6f"|format(trade.amount) }}</td>
                 <td>${{ "%.2f"|format(trade.cost) }}</td>
             </tr>
@@ -346,25 +2284,50 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
+@app.before_request
+def require_basic_auth():
+    if not DASHBOARD_PASSWORD:
+        return None
+    auth = request.authorization
+    if auth and auth.password is not None \
+            and hmac.compare_digest((auth.username or '').encode(), DASHBOARD_USER.encode()) \
+            and hmac.compare_digest(auth.password.encode(), DASHBOARD_PASSWORD.encode()):
+        return None
+    return Response('Authentication required', 401,
+                    {'WWW-Authenticate': 'Basic realm="KrakenBot Dashboard"'})
+
+
 @app.route('/')
 def dashboard():
     try:
         pnl_data = load_ledger()
         return render_template_string(
-            HTML_TEMPLATE, 
-            status=bot_status, 
+            HTML_TEMPLATE,
+            status=bot_status,
             trades=pnl_data[-10:],
-            scanner=scanner_cache
+            scanner=scanner_cache,
+            timeframe='1d' if STRATEGY_MODE in ('trend', 'momentum') else TIMEFRAME,
+            strategy=strategy_description(),
+            mode=STRATEGY_MODE,
+            lookbacks=list(MOMENTUM_LOOKBACKS),
+            top_k=MOMENTUM_TOP_K,
+            dry_run=DRY_RUN
         )
     except Exception as e:
         logging.exception("Error rendering dashboard GET request")
         return f"An error occurred: {e}", 500
 
+
 if __name__ == '__main__':
+    if DASHBOARD_HOST not in ('127.0.0.1', 'localhost', '::1') and not DASHBOARD_PASSWORD:
+        logging.warning(f"Dashboard bound to {DASHBOARD_HOST} without DASHBOARD_PASSWORD; "
+                        f"anyone on the network can view it.")
+
     bot_thread = threading.Thread(target=run_trading_bot, daemon=True)
     bot_thread.start()
-    
+
     scanner_thread = threading.Thread(target=update_scanner_cache, daemon=True)
     scanner_thread.start()
-    
-    app.run(host='0.0.0.0', port=5000)
+
+    app.run(host=DASHBOARD_HOST, port=DASHBOARD_PORT)
