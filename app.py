@@ -9,6 +9,7 @@ import logging
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 import ccxt
+import numpy as np
 import pandas as pd
 from flask import Flask, Response, request, render_template_string
 from dotenv import load_dotenv
@@ -113,6 +114,27 @@ BACKTEST_START_CASH = 1000.0
 BACKTEST_TAKER_SLIPPAGE_PCT = 0.001  # extra slippage assumed on stop-loss (taker) exits
 SCANNER_REFRESH_SEC = 3600
 
+# --- Trend-following (used by STRATEGY_PRESET=trend; see CHANGES.md) ----------------
+# Daily Donchian breakout: buy when the daily close is above the highest high of the
+# previous TREND_ENTRY_DAYS days AND above its TREND_MA_DAYS simple moving average.
+# Exit when the daily close falls below the lowest low of the previous TREND_EXIT_DAYS
+# days, or intraday if price touches the ATR trailing stop (highest close since entry
+# minus TREND_ATR_MULT x ATR). Up to TREND_MAX_POSITIONS positions, each sized
+# POSITION_SIZE_PCT / TREND_MAX_POSITIONS of account equity (80%/10 = 8% each).
+STRATEGY_MODE = 'rsi'              # 'rsi' (single position, presets conservative/tuned_a)
+#                                    or 'trend' (multi-position portfolio)
+TREND_TIMEFRAME = '1d'
+TREND_ENTRY_DAYS = 55
+TREND_MA_DAYS = 200                # 0 = no moving-average filter
+TREND_EXIT_DAYS = 10               # None = no Donchian-low exit
+TREND_ATR_MULT = 6                 # None = no ATR trailing stop
+TREND_ATR_PERIOD = 14
+TREND_MAX_POSITIONS = 10
+TREND_REGIME_FILTER = False        # True: only enter while BTC/USD close > its 200-day MA
+TREND_MAX_ENTRY_CHASE_PCT = 0.03   # skip an entry if the bid ran >3% above the signal close
+TREND_EXIT_MAX_ATTEMPTS = 4        # post-only exit attempts before switching to a
+#                                    marketable (taker) limit
+
 # --- Strategy presets ----------------------------------------------------------------
 # Tuning (optimize.py, Oct 2026; Coinbase 4h history Jan 2023 - Oct 2026, train = first
 # 65% of the calendar span, test = last 35% (Jun 2025 - Oct 2026), plus Kraken's own last
@@ -133,6 +155,16 @@ STRATEGY_PRESETS = {
         RSI_OVERSOLD=33, RSI_ENTRY_MODE='below', TREND_FILTER='ema200',
         TAKE_PROFIT_PCT=0.02, TRAIL_PCT=0.02, TRAIL_ACTIVATE_PCT=0.015,
         STOP_LOSS_PCT=0.12, MAX_HOLD_HOURS=240, STOPLOSS_COOLDOWN_HOURS=72,
+    ),
+    # Trend-following portfolio (daily). Out-of-sample Jun 2025 - Oct 2026 (BTC -21%):
+    # +9.2% with 13.9% max drawdown on 10 coins, +7.3% / 9.6% on the 5-coin watchlist;
+    # 966 of 1008 tested parameter sets were positive out-of-sample. Opt-in only.
+    'trend': dict(
+        STRATEGY_MODE='trend',
+        WATCHLIST=['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD',
+                   'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
+        TREND_ENTRY_DAYS=55, TREND_MA_DAYS=200, TREND_EXIT_DAYS=10, TREND_ATR_MULT=6,
+        TREND_MAX_POSITIONS=10, TREND_REGIME_FILTER=False,
     ),
 }
 STRATEGY_PRESET = os.getenv("STRATEGY_PRESET", "conservative").strip().lower()
@@ -320,6 +352,18 @@ def check_entry_signal(df):
 
 
 def strategy_description():
+    if STRATEGY_MODE == 'trend':
+        parts = [f"daily close above prior {TREND_ENTRY_DAYS}-day high"
+                 + (f" and above {TREND_MA_DAYS}-day MA" if TREND_MA_DAYS else "")]
+        if TREND_EXIT_DAYS:
+            parts.append(f"exit on close below prior {TREND_EXIT_DAYS}-day low")
+        if TREND_ATR_MULT:
+            parts.append(f"{TREND_ATR_MULT}x ATR trailing stop")
+        if TREND_REGIME_FILTER:
+            parts.append("only while BTC > 200-day MA")
+        parts.append(f"up to {TREND_MAX_POSITIONS} positions of "
+                     f"{POSITION_SIZE_PCT / TREND_MAX_POSITIONS * 100:.0f}% equity")
+        return ", ".join(parts)
     rsi_txt = (f"RSI crosses back above {RSI_OVERSOLD}" if RSI_ENTRY_MODE == 'cross_up'
                else f"RSI < {RSI_OVERSOLD}")
     trend_txt = {'ema50': 'close > EMA50', 'ema200': f'close > EMA{EMA_LONG_PERIOD}',
@@ -336,6 +380,79 @@ def strategy_description():
     if STOPLOSS_COOLDOWN_HOURS:
         parts.append(f"{STOPLOSS_COOLDOWN_HOURS}h post-stop cooldown")
     return ", ".join(parts)
+
+
+# ----------------------------------------------------------------------------- trend helpers
+# Shared by the live 'trend' loop and portfolio_backtest.py (which sets the TREND_*
+# globals from its parameter grid). They accept pandas objects or scalars.
+def bars_per_day(timeframe):
+    return max(1, 86400 // ccxt.Exchange.parse_timeframe(timeframe))
+
+
+def donchian_high(high, n):
+    """Highest high of the PREVIOUS n bars (excludes the current bar)."""
+    return high.rolling(n, min_periods=n).max().shift(1)
+
+
+def donchian_low(low, n):
+    return low.rolling(n, min_periods=n).min().shift(1)
+
+
+def wilder_atr(high, low, close, period=14):
+    prev_close = close.shift(1)
+    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def add_trend_indicators(df, timeframe=None):
+    timeframe = timeframe or TREND_TIMEFRAME
+    bpd = bars_per_day(timeframe)
+    df = df.copy()
+    df['donch_hi'] = donchian_high(df['high'], int(TREND_ENTRY_DAYS * bpd))
+    df['donch_lo'] = donchian_low(df['low'], int(TREND_EXIT_DAYS * bpd)) if TREND_EXIT_DAYS else np.nan
+    n_ma = int((TREND_MA_DAYS or 0) * bpd)
+    df['ma'] = df['close'].rolling(n_ma, min_periods=n_ma).mean() if n_ma else np.nan
+    df['atr'] = wilder_atr(df['high'], df['low'], df['close'], TREND_ATR_PERIOD)
+    return df
+
+
+def trend_entry_signal(close, donch_hi, ma):
+    """Breakout above the prior N-day high, and above the long MA if enabled."""
+    if close is None or donch_hi is None or pd.isna(close) or pd.isna(donch_hi):
+        return False
+    if close <= donch_hi:
+        return False
+    if TREND_MA_DAYS:
+        return ma is not None and not pd.isna(ma) and close > ma
+    return True
+
+
+def trend_entry_strength(close, donch_hi):
+    return close / donch_hi if donch_hi else 0.0
+
+
+def trend_exit_signal(close, donch_lo):
+    if not TREND_EXIT_DAYS or donch_lo is None or pd.isna(donch_lo) or pd.isna(close):
+        return False
+    return close < donch_lo
+
+
+def trend_initial_stop(entry_price, atr):
+    if not TREND_ATR_MULT or atr is None or pd.isna(atr):
+        return None
+    return entry_price - TREND_ATR_MULT * atr
+
+
+def trend_update_stop(stop, highest_close, atr):
+    """Trailing stop only ever moves up: highest close since entry - mult x ATR."""
+    if not TREND_ATR_MULT or atr is None or pd.isna(atr):
+        return stop
+    new = highest_close - TREND_ATR_MULT * atr
+    return new if stop is None else max(stop, new)
+
+
+def trend_stop_hit(price, stop):
+    return stop is not None and price is not None and price <= stop
 
 
 def fee_floor_price(entry_price):
@@ -413,6 +530,9 @@ def default_state():
     state["pending_order"] = None
     state["last_entry_signal"] = {}   # symbol -> signal candle timestamp already traded
     state["cooldowns"] = {}           # symbol -> ISO time until which new entries are blocked
+    state["positions"] = {}           # 'trend' mode: symbol -> position dict
+    state["trend_last_bar"] = None    # 'trend' mode: last daily bar evaluated (ms)
+    state["trend_pending_entries"] = None
     if DRY_RUN:
         state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
     return state
@@ -456,6 +576,8 @@ def load_state():
             state["last_entry_signal"] = {}
         if state.get("cooldowns") is None:
             state["cooldowns"] = {}
+        if state.get("positions") is None:
+            state["positions"] = {}
         if DRY_RUN and not state.get("paper"):
             state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
         return state
@@ -815,6 +937,73 @@ def apply_sell_fill(exchange, state, symbol, fill, reason):
     return closed
 
 
+def _paper_apply(state, base, quote, base_delta, quote_delta):
+    if DRY_RUN:
+        paper = state.setdefault("paper", {})
+        paper[base] = paper.get(base, 0.0) + base_delta
+        paper[quote] = paper.get(quote, 0.0) + quote_delta
+
+
+def apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=None, reason="Trend Breakout"):
+    """'trend' mode: open a position in state['positions'] from an actual fill."""
+    state["pending_order"] = None
+    if fill is None or fill.filled <= 0:
+        save_state(state)
+        return False
+    base, quote = market_base_quote(exchange, symbol)
+    amount, cost = fill.filled, fill.cost
+    if fill.fee:
+        if fill.fee_currency == base:
+            amount -= fill.fee
+        elif fill.fee_currency == quote:
+            cost += fill.fee
+    _paper_apply(state, base, quote, amount, -cost)
+    opened = is_sellable(exchange, symbol, amount, fill.average)
+    if opened:
+        state.setdefault("positions", {})[symbol] = {
+            "amount": amount, "entry_price": fill.average, "entry_cost": cost,
+            "entry_time": utc_now().isoformat(), "highest_close": fill.average,
+            "stop": trend_initial_stop(fill.average, atr), "exit_pending": None, "exit_attempts": 0,
+        }
+    else:
+        logging.warning(f"Buy fill of {amount} {base} is below the market minimum (dust); not tracked.")
+    save_state(state)
+    save_trade("BUY", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
+               fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason,
+               partial=fill.status != 'closed')
+    return opened
+
+
+def apply_portfolio_sell_fill(exchange, state, symbol, fill, reason):
+    state["pending_order"] = None
+    positions = state.setdefault("positions", {})
+    pos = positions.get(symbol)
+    if fill is None or fill.filled <= 0 or pos is None:
+        save_state(state)
+        return False
+    base, quote = market_base_quote(exchange, symbol)
+    quote_fee = (fill.fee or 0.0) if fill.fee_currency == quote else 0.0
+    proceeds = fill.cost - quote_fee
+    basis_per_unit = pos["entry_cost"] / pos["amount"] if pos["amount"] else 0.0
+    pnl = proceeds - basis_per_unit * fill.filled
+    _paper_apply(state, base, quote, -fill.filled, proceeds)
+    remaining = max(pos["amount"] - fill.filled, 0.0)
+    if remaining > 0 and is_sellable(exchange, symbol, remaining, fill.average):
+        pos["amount"] = remaining
+        pos["entry_cost"] -= basis_per_unit * fill.filled
+        closed = False
+    else:
+        if remaining > 0:
+            logging.warning(f"Remaining {remaining} {base} is dust; closing tracked position.")
+        positions.pop(symbol, None)
+        closed = True
+    save_state(state)
+    save_trade("SELL", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
+               fee_currency=fill.fee_currency, order_id=fill.order_id, reason=reason, pnl=pnl,
+               partial=fill.status != 'closed')
+    return closed
+
+
 def resolve_pending_order(exchange, state):
     """Handle an order left over from a crash / network error. Never records a trade
     unless the exchange confirms a fill. Returns True if nothing is pending anymore."""
@@ -855,6 +1044,14 @@ def resolve_pending_order(exchange, state):
             return False
 
     fill = fill_from_order(order, symbol, exchange, pending.get("post_only", True))
+    if pending.get("mode") == 'portfolio':
+        if pending["side"] == 'buy':
+            apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=pending.get("atr"),
+                                     reason=pending.get("reason", "Trend Breakout") + " (recovered)")
+        else:
+            apply_portfolio_sell_fill(exchange, state, symbol, fill,
+                                      reason=pending.get("reason", "Exit") + " (recovered)")
+        return True
     if pending["side"] == 'buy':
         apply_buy_fill(exchange, state, symbol, fill, signal_ts=pending.get("signal_ts"),
                        reason=pending.get("reason", "RSI + EMA Setup") + " (recovered)")
@@ -910,6 +1107,16 @@ def reconcile_on_startup(exchange):
         logging.warning("New entries on those symbols are skipped while their orders stay open.")
 
     free, total = get_balances(exchange, state)
+    for sym, pos in list((state.get("positions") or {}).items()):
+        base, _ = market_base_quote(exchange, sym)
+        held = float(total.get(base) or 0.0)
+        if held < pos["amount"] * (1 - POSITION_TOLERANCE_PCT):
+            logging.warning(f"Discrepancy: trend position {sym} {pos['amount']} but exchange holds {held}.")
+            if held > 0 and is_sellable(exchange, sym, held, pos["entry_price"]):
+                pos["amount"] = held
+            else:
+                logging.error(f"No sellable {base} for trend position {sym}; removing it from state.")
+                state["positions"].pop(sym)
     symbol = state.get("symbol")
     if symbol:
         base, _ = market_base_quote(exchange, symbol)
@@ -1118,8 +1325,32 @@ def run_backtest_simulation(symbol):
         return {"symbol": name, "return_pct": 0.0, "win_rate": 0.0, "trades": 0, "days": 0}
 
 
+def trend_scanner_rows():
+    rows = []
+    ex = get_public_exchange()
+    for sym in WATCHLIST:
+        try:
+            df = fetch_trend_df(ex, sym)
+            r = df.iloc[-1]
+            rows.append({"symbol": sym.split('/')[0], "close": float(r['close']),
+                         "donch_hi": float(r['donch_hi']) if not pd.isna(r['donch_hi']) else 0.0,
+                         "ma": float(r['ma']) if not pd.isna(r['ma']) else 0.0,
+                         "signal": bool(trend_entry_signal(float(r['close']), r['donch_hi'], r['ma']))})
+        except Exception as e:
+            logging.error(f"Trend scanner error for {sym}: {e}")
+    return rows
+
+
 def update_scanner_cache():
     while True:
+        if STRATEGY_MODE == 'trend':
+            try:
+                scanner_cache["trend_rows"] = trend_scanner_rows()
+                scanner_cache["last_updated"] = fmt_ts(utc_now())
+            except Exception as e:
+                logging.error(f"Error updating trend scanner: {e}")
+            time.sleep(SCANNER_REFRESH_SEC)
+            continue
         try:
             results = [run_backtest_simulation(sym) for sym in WATCHLIST]
             scanner_cache["results"] = sorted(results, key=lambda x: x['return_pct'], reverse=True)
@@ -1300,6 +1531,166 @@ def scan_and_enter(exchange, state, usd_free):
         bot_status["last_action"] = f"Buy on {base} not filled within {ORDER_TIMEOUT_SEC}s; cancelled."
 
 
+# ----------------------------------------------------------------------------- trend mode
+def fetch_trend_df(exchange, symbol):
+    """Closed daily candles with trend indicators (enough history for the 200-day MA)."""
+    bpd = bars_per_day(TREND_TIMEFRAME)
+    need = int(max(TREND_MA_DAYS or 0, TREND_ENTRY_DAYS, TREND_EXIT_DAYS or 0) * bpd) + 60
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TREND_TIMEFRAME, limit=min(720, need))
+    return add_trend_indicators(ohlcv_to_closed_df(ohlcv, TREND_TIMEFRAME, exchange.milliseconds()))
+
+
+def trend_exit(exchange, state, symbol, urgent, reason, free):
+    pos = state["positions"][symbol]
+    base, _ = market_base_quote(exchange, symbol)
+    amount = round_amount(exchange, symbol, min(pos["amount"], float(free.get(base) or 0.0)))
+    ticker = exchange.fetch_ticker(symbol)
+    bid = ticker.get('bid') or ticker.get('last')
+    ask = ticker.get('ask') or ticker.get('last')
+    if urgent:
+        price = round_price(exchange, symbol, bid * (1 - STOP_LOSS_MAX_SLIPPAGE_PCT), 'buy')
+        post_only, timeout = False, STOP_LOSS_ORDER_TIMEOUT_SEC
+    else:
+        price = round_price(exchange, symbol, ask, 'sell')
+        post_only, timeout = True, ORDER_TIMEOUT_SEC
+    ok, msg = check_order_limits(exchange, symbol, amount, price)
+    if not ok:
+        logging.warning(f"Cannot sell {symbol}: {msg}")
+        return False
+    fill = execute_order(exchange, state, symbol, 'sell', amount, price, post_only, timeout,
+                         {"mode": "portfolio", "reason": reason})
+    if fill is None:
+        return False
+    closed = apply_portfolio_sell_fill(exchange, state, symbol, fill, reason)
+    if not closed and symbol in state["positions"]:
+        p = state["positions"][symbol]
+        p["exit_pending"] = reason
+        p["exit_attempts"] = int(p.get("exit_attempts") or 0) + (0 if fill.filled > 0 else 1)
+        save_state(state)
+    if fill.filled > 0:
+        bot_status["last_action"] = f"Sold {fill.filled:g} {base} at ${fill.average:,.4f} ({reason})"
+    return closed
+
+
+def trend_iteration(exchange, state, free, total):
+    """One loop of the multi-position trend strategy.
+
+    Every loop: check ATR trailing stops against the live price (urgent, marketable
+    exit) and retry pending exits/entries. Once per newly closed daily candle: update
+    stops, flag Donchian-low exits and queue breakout entries (strongest first).
+    """
+    positions = state.setdefault("positions", {})
+    bar_ms = ccxt.Exchange.parse_timeframe(TREND_TIMEFRAME) * 1000
+    now_ms = exchange.milliseconds()
+    expected_bar = (now_ms // bar_ms) * bar_ms - bar_ms       # last bar that should be closed
+
+    # 1) intraday ATR stops + pending exits
+    prices = {}
+    for sym in list(positions):
+        ticker = exchange.fetch_ticker(sym)
+        price = ticker.get('last') or ticker.get('bid')
+        prices[sym] = price
+        pos = positions[sym]
+        if trend_stop_hit(price, pos.get("stop")):
+            logging.info(f"ATR stop hit on {sym}: {price} <= {pos['stop']:.6g}")
+            trend_exit(exchange, state, sym, True, f"ATR Stop ({TREND_ATR_MULT}x)", free)
+        elif pos.get("exit_pending"):
+            urgent = int(pos.get("exit_attempts") or 0) >= TREND_EXIT_MAX_ATTEMPTS
+            trend_exit(exchange, state, sym, urgent, pos["exit_pending"], free)
+        free, total = get_balances(exchange, state)
+
+    # 2) once per new daily close: stops, exit signals, entry signals
+    if state.get("trend_last_bar") != expected_bar:
+        rows, btc_ok = {}, True
+        for sym in WATCHLIST:
+            df = fetch_trend_df(exchange, sym)
+            if len(df) and int(df['timestamp'].iloc[-1]) == expected_bar:
+                rows[sym] = df.iloc[-1]
+        if TREND_REGIME_FILTER:
+            bdf = fetch_trend_df(exchange, 'BTC/USD')
+            bclose = bdf['close']
+            bma = bclose.rolling(200 * bars_per_day(TREND_TIMEFRAME)).mean()
+            btc_ok = bool(len(bdf) and bclose.iloc[-1] > bma.iloc[-1])
+        if rows:
+            for sym, pos in positions.items():
+                r = rows.get(sym)
+                if r is None:
+                    continue
+                pos["highest_close"] = max(pos.get("highest_close") or 0.0, float(r['close']))
+                pos["stop"] = trend_update_stop(pos.get("stop"), pos["highest_close"], float(r['atr']))
+                if not pos.get("exit_pending") and trend_exit_signal(float(r['close']), r['donch_lo']):
+                    pos["exit_pending"] = f"Close below {TREND_EXIT_DAYS}-day low"
+                    pos["exit_attempts"] = 0
+            cands = [s for s, r in rows.items() if s not in positions and btc_ok
+                     and trend_entry_signal(float(r['close']), r['donch_hi'], r['ma'])]
+            cands.sort(key=lambda s: trend_entry_strength(float(rows[s]['close']), rows[s]['donch_hi']),
+                       reverse=True)
+            state["trend_pending_entries"] = {
+                "bar": expected_bar, "symbols": cands,
+                "signal": {s: {"close": float(rows[s]['close']), "atr": float(rows[s]['atr'])} for s in cands}}
+            state["trend_last_bar"] = expected_bar
+            save_state(state)
+            logging.info(f"Trend bar {expected_bar}: entry candidates {cands}; "
+                         f"exits pending {[s for s, p in positions.items() if p.get('exit_pending')]}")
+            for sym in [s for s, p in positions.items() if p.get("exit_pending")]:
+                trend_exit(exchange, state, sym, False, positions[sym]["exit_pending"], free)
+                free, total = get_balances(exchange, state)
+        else:
+            logging.info("Latest daily candle not available yet; will retry next loop.")
+
+    # 3) entries queued for the current bar (retried each loop until filled or stale)
+    pend = state.get("trend_pending_entries") or {}
+    if pend.get("bar") == expected_bar and pend.get("symbols"):
+        blocked = set()
+        if not DRY_RUN:
+            blocked = {o.get('symbol') for o in exchange.fetch_open_orders()}
+        for sym in list(pend["symbols"]):
+            if len(positions) >= TREND_MAX_POSITIONS:
+                break
+            if sym in positions or sym in blocked:
+                continue
+            free, total = get_balances(exchange, state)
+            usd_free = float(free.get('USD') or 0.0)
+            equity = float(total.get('USD') or 0.0) + sum(
+                p["amount"] * (prices.get(s) or p["entry_price"]) for s, p in positions.items())
+            ticker = exchange.fetch_ticker(sym)
+            bid = ticker.get('bid') or ticker.get('last')
+            sig = pend["signal"][sym]
+            if bid > sig["close"] * (1 + TREND_MAX_ENTRY_CHASE_PCT):
+                logging.info(f"Skipping {sym}: bid {bid} ran more than {TREND_MAX_ENTRY_CHASE_PCT:.0%} "
+                             f"above the signal close {sig['close']}")
+                pend["symbols"].remove(sym)
+                continue
+            usd = min(equity * POSITION_SIZE_PCT / TREND_MAX_POSITIONS, usd_free * 0.99)
+            price = round_price(exchange, sym, bid, 'buy')
+            amount = round_amount(exchange, sym, usd / price) if price else 0.0
+            ok, msg = check_order_limits(exchange, sym, amount, price)
+            if not ok or amount * price < MIN_TRADE_USD:
+                logging.info(f"Skipping trend entry on {sym}: {msg or 'below MIN_TRADE_USD'}")
+                pend["symbols"].remove(sym)
+                continue
+            fill = execute_order(exchange, state, sym, 'buy', amount, price, True, ORDER_TIMEOUT_SEC,
+                                 {"mode": "portfolio", "reason": "Trend Breakout", "atr": sig["atr"]})
+            if fill is None:
+                break                                   # unresolved order: reconcile first
+            apply_portfolio_buy_fill(exchange, state, sym, fill, atr=sig["atr"])
+            if fill.filled > 0:
+                pend["symbols"].remove(sym)
+                bot_status["last_action"] = f"Bought {fill.filled:g} {sym.split('/')[0]} at ${fill.average:,.4f} (Trend Breakout)"
+        save_state(state)
+
+    # dashboard
+    held = sorted(positions)
+    bot_status["active_symbol"] = (", ".join(s.split('/')[0] for s in held) + f" ({len(held)}/{TREND_MAX_POSITIONS})"
+                                   if held else "None (Trend Watch)")
+    bot_status["asset_balance"] = float(len(held))
+    bot_status["positions"] = [dict(symbol=s, amount=p["amount"], entry=p["entry_price"],
+                                    stop=p.get("stop"), exit_pending=p.get("exit_pending")) for s, p in
+                               sorted(positions.items())]
+    if not held and not (pend.get("symbols")):
+        bot_status["last_action"] = "No trend breakouts. Holding USD."
+
+
 def trading_iteration(exchange):
     state = load_state()
     free, total = get_balances(exchange, state)
@@ -1313,7 +1704,19 @@ def trading_iteration(exchange):
         free, total = get_balances(exchange, state)
         usd_free = float(free.get('USD') or 0.0)
 
-    if state.get("symbol"):
+    if STRATEGY_MODE == 'trend':
+        if state.get("symbol"):
+            logging.error(f"State holds an RSI-mode position in {state['symbol']} but the preset is "
+                          f"'trend'. Not trading until it is closed or the preset is switched back.")
+            bot_status["last_action"] = "Blocked: RSI-mode position open while preset is 'trend'."
+            return
+        trend_iteration(exchange, state, free, total)
+    elif state.get("positions"):
+        logging.error(f"State holds trend-mode positions {sorted(state['positions'])} but the preset is "
+                      f"'{STRATEGY_PRESET}'. Not trading until they are closed or the preset is switched back.")
+        bot_status["last_action"] = "Blocked: trend positions open while preset is not 'trend'."
+        return
+    elif state.get("symbol"):
         manage_position(exchange, state, free, total)
     else:
         bot_status["asset_balance"] = 0.0
@@ -1405,6 +1808,18 @@ HTML_TEMPLATE = """
     <div class="card">
         <h2>Multi-Asset Rotation Scanner</h2>
         <p style="font-size: 13px; color: #aaa;">Simulates ~{{ scanner.days }}-day performance of the live strategy ({{ timeframe }} candles: {{ strategy }}), including Kraken fees. (Updated: {{ scanner.last_updated }})</p>
+        {% if mode == 'trend' %}
+        <table>
+            <tr><th>Asset</th><th>Last Daily Close</th><th>Prior High (entry level)</th><th>Long MA</th><th>Breakout Signal</th></tr>
+            {% for r in scanner.trend_rows or [] %}
+            <tr>
+                <td style="font-weight:bold; color: #00adb5;">{{ r.symbol }}</td>
+                <td>{{ "%.4f"|format(r.close) }}</td><td>{{ "%.4f"|format(r.donch_hi) }}</td><td>{{ "%.4f"|format(r.ma) }}</td>
+                <td style="color: {{ '#28a745' if r.signal else '#aaa' }}; font-weight:bold;">{{ 'YES' if r.signal else 'no' }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
         <table>
             <tr><th>Asset</th><th>{{ scanner.days }}-Day Return</th><th>Win Rate</th><th>Trades Executed</th></tr>
             {% for item in scanner.results %}
@@ -1416,7 +1831,21 @@ HTML_TEMPLATE = """
             </tr>
             {% endfor %}
         </table>
+        {% endif %}
     </div>
+
+    {% if status.positions %}
+    <div class="card">
+        <h2>Open Positions</h2>
+        <table>
+            <tr><th>Asset</th><th>Amount</th><th>Entry</th><th>Trailing Stop</th><th>Pending Exit</th></tr>
+            {% for p in status.positions %}
+            <tr><td style="font-weight:bold; color: #00adb5;">{{ p.symbol }}</td><td>{{ "%.6f"|format(p.amount) }}</td>
+                <td>{{ "%.4f"|format(p.entry) }}</td><td>{{ "%.4f"|format(p.stop) if p.stop else '-' }}</td><td>{{ p.exit_pending or '-' }}</td></tr>
+            {% endfor %}
+        </table>
+    </div>
+    {% endif %}
 
     <div class="card">
         <h2>Recent Trade Ledger</h2>
@@ -1462,6 +1891,7 @@ def dashboard():
             scanner=scanner_cache,
             timeframe=TIMEFRAME,
             strategy=strategy_description(),
+            mode=STRATEGY_MODE,
             dry_run=DRY_RUN
         )
     except Exception as e:

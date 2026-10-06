@@ -391,6 +391,96 @@ check("momentum: rotates into the rising coin and profits", mm['trades'] >= 1 an
 bh = pb.buy_hold(panel, [2])
 check("buy-and-hold benchmark loses on the falling coin", bh['return_pct'] < -45)
 
+
+# 14) live 'trend' mode (multi-position) against the fake exchange
+saved = {k: getattr(bot, k) for k in ("STRATEGY_MODE", "WATCHLIST", "TREND_ENTRY_DAYS", "TREND_MA_DAYS",
+         "TREND_EXIT_DAYS", "TREND_ATR_MULT", "TREND_MAX_POSITIONS", "TREND_REGIME_FILTER")}
+bot.STRATEGY_MODE = 'trend'; bot.WATCHLIST = ['SOL/USD']
+bot.TREND_ENTRY_DAYS, bot.TREND_MA_DAYS, bot.TREND_EXIT_DAYS = 20, 50, 10
+bot.TREND_ATR_MULT, bot.TREND_MAX_POSITIONS, bot.TREND_REGIME_FILTER = 3, 2, False
+for f in (bot.STATE_FILE, bot.LEDGER_FILE):
+    if os.path.exists(f): os.remove(f)
+def daily_ohlcv(closes, now_ms):
+    t_last = (now_ms // day) * day                      # today's (forming) candle
+    n_ = len(closes); c = np.asarray(closes, float); o = np.concatenate([[c[0]], c[:-1]])
+    rows = [[int(t_last - (n_ - 1 - i) * day), float(o[i]), float(max(o[i], c[i]) * 1.01),
+             float(min(o[i], c[i]) * 0.99), float(c[i]), 1.0] for i in range(n_)]
+    return rows
+ex = FakeKraken({'fill_frac': 1.0})
+nowms = ex.milliseconds()
+breakout = [100.0] * 80 + [101, 103, 106, 110] + [110]          # last element = forming candle
+ex.scenario.update({'ohlcv': daily_ohlcv(breakout, nowms), 'price': 110.0})
+st = bot.load_state()
+free, total = bot.get_balances(ex, st)
+bot.trend_iteration(ex, st, free, total)
+st = bot.load_state(); pos = st['positions'].get('SOL/USD')
+check("trend: breakout buy placed post-only at bid", ex.created and ex.created[-1][2] == 'buy'
+      and ex.created[-1][5].get('postOnly') and abs(ex.created[-1][4] - 109.95) < 1e-9)
+check("trend: sized equity*80%/max_positions (~$400 of $1000)", abs(ex.created[-1][3] * 109.95 - 400) < 1.0)
+check("trend: position stored from fill with ATR stop below entry", pos and pos['amount'] > 0 and pos['stop'] < pos['entry_price'])
+check("trend: bar recorded, pending entry consumed", st['trend_last_bar'] is not None and st['trend_pending_entries']['symbols'] == [])
+n_before = len(ex.created)
+free, total = bot.get_balances(ex, st); bot.trend_iteration(ex, st, free, total)
+check("trend: no duplicate buy on the same bar", len(ex.created) == n_before)
+# ATR stop hit intraday -> urgent marketable sell of the tracked amount
+ex.scenario['price'] = pos['stop'] * 0.99
+st = bot.load_state(); free, total = bot.get_balances(ex, st); bot.trend_iteration(ex, st, free, total)
+st = bot.load_state()
+check("trend: ATR stop -> non-post-only sell below bid, position closed",
+      ex.created[-1][2] == 'sell' and not ex.created[-1][5].get('postOnly') and 'SOL/USD' not in st['positions']
+      and bot.load_ledger()[-1]['type'] == 'SELL')
+# Donchian-low exit on a new bar; post-only attempts, then escalate to taker
+st['positions']['SOL/USD'] = {"amount": 1.0, "entry_price": 100.0, "entry_cost": 100.25, "entry_time": bot.utc_now().isoformat(),
+                              "highest_close": 110.0, "stop": 50.0, "exit_pending": None, "exit_attempts": 0}
+st['trend_last_bar'] = 0; bot.save_state(st); ex.bal['SOL'] = 1.0
+breakdown = [100.0] * 80 + [104, 103, 102, 101, 100, 99, 98, 97, 96, 95, 90] + [90]
+ex.scenario.update({'ohlcv': daily_ohlcv(breakdown, nowms), 'price': 90.0, 'fill_frac': 0.0})
+free, total = bot.get_balances(ex, st); bot.trend_iteration(ex, st, free, total)
+st = bot.load_state(); p_ = st['positions']['SOL/USD']
+check("trend: close below 10-day low -> post-only exit attempted, unfilled keeps position",
+      ex.created[-1][2] == 'sell' and ex.created[-1][5].get('postOnly') and p_['exit_pending'] and p_['exit_attempts'] >= 1)
+for _ in range(bot.TREND_EXIT_MAX_ATTEMPTS + 1):
+    free, total = bot.get_balances(ex, st); bot.trend_iteration(ex, st, free, total); st = bot.load_state()
+check("trend: exit escalates to marketable limit after max attempts", not ex.created[-1][5].get('postOnly'))
+ex.scenario['fill_frac'] = 1.0
+free, total = bot.get_balances(ex, st); bot.trend_iteration(ex, st, free, total); st = bot.load_state()
+check("trend: exit fills and position is removed", 'SOL/USD' not in st['positions'])
+# network error on a trend entry -> pending kept (mode=portfolio) and recovered later
+st['trend_last_bar'] = 0; bot.save_state(st)
+ex2 = FakeKraken({'ohlcv': daily_ohlcv(breakout, nowms), 'price': 110.0, 'create_network_error': True})
+free, total = bot.get_balances(ex2, st); bot.trend_iteration(ex2, st, free, total); st = bot.load_state()
+check("trend: unresolved entry leaves pending_order (mode=portfolio), no position",
+      st['pending_order'] and st['pending_order'].get('mode') == 'portfolio' and 'SOL/USD' not in st['positions'])
+uref = st['pending_order']['userref']
+ex2.orders['Y1'] = {'id': 'Y1', 'symbol': 'SOL/USD', 'side': 'buy', 'amount': 3.0, 'price': 109.95, 'status': 'closed',
+                    'filled': 3.0, 'average': 109.95, 'cost': 329.85, 'fee': {'cost': 0.82, 'currency': 'USD'},
+                    'info': {'userref': uref}}
+bot.resolve_pending_order(ex2, st); st = bot.load_state()
+check("trend: recovered fill opens the portfolio position", st['positions'].get('SOL/USD', {}).get('amount') == 3.0
+      and st['pending_order'] is None)
+# mode guard: RSI position while preset is trend -> blocked
+st['symbol'] = 'SOL/USD'; bot.save_state(st); n_before = len(ex2.created)
+bot.trading_iteration(ex2)
+check("mode guard: RSI position blocks trend trading", len(ex2.created) == n_before and 'Blocked' in bot.bot_status['last_action'])
+st = bot.load_state(); st['symbol'] = None; bot.save_state(st)
+r = client.get('/', headers=hdr)
+check("dashboard renders in trend mode", r.status_code == 200 and b'Breakout Signal' in r.data)
+bot.STRATEGY_MODE = 'rsi'
+bot.trading_iteration(ex2)
+check("mode guard: trend positions block RSI trading", 'Blocked' in bot.bot_status['last_action'])
+# DRY_RUN trend iteration uses the paper wallet and sends nothing
+bot.DRY_RUN = True; bot.STRATEGY_MODE = 'trend'
+for f in (bot.STATE_FILE, bot.LEDGER_FILE):
+    if os.path.exists(f): os.remove(f)
+ex3 = FakeKraken({'ohlcv': daily_ohlcv(breakout, nowms), 'price': 110.0})
+st = bot.default_state(); free, total = bot.get_balances(ex3, st); bot.trend_iteration(ex3, st, free, total)
+st = bot.load_state()
+check("trend DRY_RUN: paper position opened, no orders sent", ex3.created == [] and 'SOL/USD' in st['positions']
+      and st['paper']['USD'] < 1000)
+bot.DRY_RUN = False
+for k_, v_ in saved.items():
+    setattr(bot, k_, v_)
+
 # 12) shipped defaults are valid and the backtest runs with them
 for _k, _v in SHIPPED.items():
     setattr(bot, _k, _v)

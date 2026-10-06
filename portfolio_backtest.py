@@ -19,6 +19,8 @@ minus the maker fee.
 import numpy as np
 import pandas as pd
 
+import app   # shared trend indicator / decision helpers (same code as the live bot)
+
 MAKER_FEE = 0.0025
 TAKER_FEE = 0.0040
 STOP_SLIPPAGE = 0.001
@@ -53,15 +55,13 @@ class Panel:
     def donch_hi(self, days):
         k = ('dh', days)
         if k not in self._cache:
-            n = int(days * self.bpd)
-            self._cache[k] = pd.DataFrame(self.H).rolling(n, min_periods=n).max().shift(1).to_numpy()
+            self._cache[k] = app.donchian_high(pd.DataFrame(self.H), int(days * self.bpd)).to_numpy()
         return self._cache[k]
 
     def donch_lo(self, days):
         k = ('dl', days)
         if k not in self._cache:
-            n = int(days * self.bpd)
-            self._cache[k] = pd.DataFrame(self.L).rolling(n, min_periods=n).min().shift(1).to_numpy()
+            self._cache[k] = app.donchian_low(pd.DataFrame(self.L), int(days * self.bpd)).to_numpy()
         return self._cache[k]
 
     def sma(self, days):
@@ -82,10 +82,8 @@ class Panel:
     def atr(self, period=14):
         k = ('atr', period)
         if k not in self._cache:
-            prev_c = np.vstack([np.full((1, self.C.shape[1]), np.nan), self.C[:-1]])
-            tr = np.nanmax(np.stack([self.H - self.L, np.abs(self.H - prev_c), np.abs(self.L - prev_c)]), axis=0)
-            tr[np.isnan(self.C)] = np.nan
-            self._cache[k] = pd.DataFrame(tr).ewm(alpha=1 / period, adjust=False, min_periods=period).mean().to_numpy()
+            self._cache[k] = app.wilder_atr(pd.DataFrame(self.H), pd.DataFrame(self.L),
+                                            pd.DataFrame(self.C), period).to_numpy()
         return self._cache[k]
 
     def btc_regime(self, days=200):
@@ -156,21 +154,32 @@ def _range(panel, start_ms, end_ms):
 
 
 # ----------------------------------------------------------------------------- trend
+def set_trend_params(p):
+    """Copy a parameter dict onto app's TREND_* globals used by the shared helpers."""
+    app.TREND_ENTRY_DAYS = p['entry_days']
+    app.TREND_MA_DAYS = p.get('ma_days') or 0
+    app.TREND_EXIT_DAYS = p.get('exit_days')
+    app.TREND_ATR_MULT = p.get('atr_mult')
+    app.TREND_MAX_POSITIONS = p['k']
+    app.TREND_REGIME_FILTER = bool(p.get('regime'))
+
+
 def trend_sim(panel, p, start_ms=None, end_ms=None, maker=MAKER_FEE, taker=TAKER_FEE):
     """p: entry_days, ma_days (0 = off), atr_mult (None = off), exit_days (None = off),
-    regime (bool), k (max concurrent positions)."""
-    O, H, L, C = panel.O, panel.H, panel.L, panel.C
+    regime (bool), k (max concurrent positions). Decisions use app.trend_* helpers."""
+    set_trend_params(p)
+    O, L, C = panel.O, panel.L, panel.C
     dh = panel.donch_hi(p['entry_days'])
-    dl = panel.donch_lo(p['exit_days']) if p.get('exit_days') else None
-    ma = panel.sma(p['ma_days']) if p.get('ma_days') else None
-    atr = panel.atr(14)
+    dl = panel.donch_lo(p['exit_days']) if p.get('exit_days') else np.full_like(C, np.nan)
+    ma = panel.sma(p['ma_days']) if p.get('ma_days') else np.full_like(C, np.nan)
+    atr = panel.atr(app.TREND_ATR_PERIOD)
     reg = panel.btc_regime(200) if p.get('regime') else None
-    k, mult = p['k'], p.get('atr_mult')
+    k = p['k']
     acct = Account(maker=maker, taker=taker)
     i0, i1 = _range(panel, start_ms, end_ms)
     eq, pend_exit, pend_entry = [], set(), []
     for t in range(i0, i1):
-        # --- at the open: pending signal exits, then entries
+        # --- at the open: pending signal exits, then entries (strongest breakout first)
         for j in list(pend_exit):
             if j in acct.pos and np.isfinite(O[t, j]):
                 acct.sell(j, O[t, j])
@@ -180,32 +189,26 @@ def trend_sim(panel, p, start_ms=None, end_ms=None, maker=MAKER_FEE, taker=TAKER
             for j in pend_entry:
                 if len(acct.pos) >= k or j in acct.pos or not np.isfinite(O[t, j]):
                     continue
-                stop = O[t, j] - mult * atr[t - 1, j] if mult else None
-                acct.buy(j, O[t, j], equity * EXPOSURE / k, stop=stop, hi=O[t, j])
+                acct.buy(j, O[t, j], equity * EXPOSURE / k,
+                         stop=app.trend_initial_stop(O[t, j], atr[t - 1, j]), hi=O[t, j])
             pend_entry = []
         # --- during the bar: ATR trailing stop (taker + slippage)
-        if mult:
-            for j in list(acct.pos):
-                s = acct.pos[j]['stop']
-                if s is not None and np.isfinite(L[t, j]) and L[t, j] <= s:
-                    acct.sell(j, min(O[t, j], s), taker=True, slippage=STOP_SLIPPAGE)
+        for j in list(acct.pos):
+            s_ = acct.pos[j]['stop']
+            if np.isfinite(L[t, j]) and app.trend_stop_hit(L[t, j], s_):
+                acct.sell(j, min(O[t, j], s_), taker=True, slippage=STOP_SLIPPAGE)
         # --- at the close: update stops, exit signals, entry signals
         for j, pos in acct.pos.items():
             if not np.isfinite(C[t, j]):
                 continue
             pos['hi'] = max(pos['hi'], C[t, j])
-            if mult and np.isfinite(atr[t, j]):
-                pos['stop'] = max(pos['stop'] if pos['stop'] is not None else -np.inf, pos['hi'] - mult * atr[t, j])
-            if dl is not None and np.isfinite(dl[t, j]) and C[t, j] < dl[t, j]:
+            pos['stop'] = app.trend_update_stop(pos['stop'], pos['hi'], atr[t, j])
+            if app.trend_exit_signal(C[t, j], dl[t, j]):
                 pend_exit.add(j)
         if len(acct.pos) < k and (reg is None or reg[t]):
-            with np.errstate(invalid='ignore'):
-                sig = C[t] > dh[t]
-                if ma is not None:
-                    sig &= C[t] > ma[t]
-            cands = [j for j in np.flatnonzero(sig) if j not in acct.pos]
-            # strongest breakout first
-            cands.sort(key=lambda j: C[t, j] / dh[t, j], reverse=True)
+            cands = [j for j in range(C.shape[1]) if j not in acct.pos
+                     and app.trend_entry_signal(C[t, j], dh[t, j], ma[t, j])]
+            cands.sort(key=lambda j: app.trend_entry_strength(C[t, j], dh[t, j]), reverse=True)
             pend_entry = cands[:k - len(acct.pos)]
         eq.append(acct.equity(C[t]))
     return _metrics(acct, eq, panel.ts[i0:i1], C[i1 - 1])
