@@ -358,3 +358,176 @@ cutting losses in a falling market.
   $125.
 - **Momentum's results** came from a forced regime filter that the train grid itself did not
   prefer, which is a further reason not to rely on it.
+
+## Momentum universe expansion (Oct 2026): more coins didn't help; no new preset
+
+**Question:** would momentum rotation do better with other coins? **No, not robustly.** I
+built universes only from liquidity and listing rules, applied point in time. None of them
+beat the current 10 coins out of sample, and most did clearly worse. The one robust
+improvement I found is not a coin list. It is **volatility-targeted sizing**, which cut
+drawdowns in every universe. The implementation condition ("clearly better and robust") was
+not met, so I did **not** add a `momentum` preset to `app.py`. The live bot is unchanged and
+the default is still `conservative`.
+
+### How the universes were built (`universe_data.py`, `python optimize.py universes`)
+- **Pool:** all 281 Kraken USD spot pairs whose coin also trades vs USD on Coinbase.
+  - Excluded: fiat, stablecoins, wrapped and staked tokens, and gold tokens.
+  - Data: Coinbase daily candles since **Jan 2022**, so the 200-day MA and listing-age rules
+    are warmed up by the Jan 2023 train start. Also Kraken's 720 daily candles for every
+    pool coin.
+- **Point-in-time rules (no look-ahead):** at each decision, a coin is eligible only if:
+  - it has at least **90 days** of price history, and
+  - it ranks in the **top-N by trailing 30-day USD volume** (close × volume), using data up
+    to the previous close only.
+  - Coins that weren't listed yet (e.g. SUI before Aug 2023, XRP on Coinbase before Jul
+    2023, PEPE/WIF before Nov 2024, TAO, HYPE) enter only once they qualify.
+  - The Kraken check ranks by **Kraken** volume.
+- **Universes tested:**
+  - `orig5`, `cur10`
+  - `dynN` (top 10/15/20/30, re-ranked daily)
+  - `dynN_nomeme` (memecoins excluded)
+  - `startN` (list frozen at the start of each period: train list as of 31 Dec 2022, test
+    list as of 11 Jun 2025)
+  - `sector20` (top-20 with at most 3 per sector; sectors are descriptive labels)
+  - `l1_payments10`, `defi10`
+  - `today20 (biased)`, which uses today's top-20 by Kraken volume, included only to show
+    the size of survivorship and look-ahead bias.
+- **Remaining bias:** the pool is coins *still listed on both exchanges today*. Coins
+  delisted since 2023 are missing, which flatters every universe somewhat.
+- **Grid, per universe:** 192 sets.
+  - Lookback: 30/60/90 days, or a **2-of-3 consensus** (top-k on at least 2 of the 30/60/90
+    lookbacks).
+  - Top 1/2/3 coins.
+  - Rebalance every 3 or 7 days.
+  - Absolute-momentum filter on/off.
+  - **Vol-targeted sizing** off or 60% annualised (weight × min(1, 0.6 / 30-day vol)).
+  - **Breadth filter** off, or hold cash unless at least 50% of the universe is above its
+    50-day SMA.
+  - BTC > 200-day MA regime filter always on.
+- **Method:** same as before.
+  - Tune on 1 Jan 2023 – 11 Jun 2025; test once on 12 Jun 2025 – 5 Oct 2026.
+  - Selection by neighbour-smoothed train Calmar score.
+  - 80% max exposure; maker fee on rotations; fills at the next open.
+  - Stress test: taker fee plus 0.3% slippage on every fill.
+  - Recommendation rule, fixed before looking at test results: an expanded universe must
+    beat `cur10` on test return/DD, on the median of its top-20 train sets, *and* on the
+    Kraken check.
+
+### Out-of-sample results (portfolio level, $1000 start, 12 Jun 2025 – 5 Oct 2026)
+
+| Universe | Settings chosen on train | Trades | Win % | Net return | Max DD | Test halves | Taker +0.3% | Kraken: ret / DD | Top-20 train sets: positive, median ret / DD |
+|---|---|---|---|---|---|---|---|---|---|
+| **cur10** (current) | consensus, top 2, 7d, abs, vol-target | 14 | 57.1 | **+35.9%** | **22.4%** | +2.7 / +11.3 | +30.7 | +36.0 / 22.4 | 20/20, +36.0 / 25.9 |
+| *cur10, previous set (30d, top 3, 3d, abs)* | – | 38 | 47.4 | +39.7% | 28.2% | | | | |
+| orig5 | 30d, top 1, 3d, abs, VT, breadth | 21 | 38.1 | +1.2% | 44.0% | −41.3 / +72.4 | −9.2 | +4.2 / 42.2 | 16/20, +8.1 / 34.3 |
+| dyn10 | consensus, top 2, 7d, VT, breadth | 17 | 35.3 | +4.7% | 31.7% | −18.6 / +16.9 | +0.9 | +12.9 / 22.8 | 18/20, +8.6 / 29.4 |
+| dyn15 | consensus, top 3, 3d, VT, breadth | 34 | 41.2 | +15.8% | 23.3% | −12.3 / +32.1 | +11.0 | +8.9 / 19.9 | 16/20, +15.8 / 23.3 |
+| dyn20 | consensus, top 1, 7d, breadth (no VT) | 7 | 71.4 | +75.2% | 35.5% | +40.9 / −2.3 | +66.9 | +162.8 / 35.5 | 16/20, +17.0 / 27.6 |
+| dyn30 | 30d, top 3, 7d, abs, VT, breadth | 29 | 51.7 | +22.2% | 18.3% | −1.3 / +9.7 | +18.7 | +24.5 / 18.3 | 18/20, +17.7 / 16.8 |
+| dyn20 no memes | consensus, top 1, 7d, breadth | 7 | 42.9 | −7.3% | 44.0% | −11.3 / +26.5 | −11.7 | +28.8 / 41.3 | 12/20, +9.9 / 42.8 |
+| dyn30 no memes | consensus, top 2, 7d, VT, breadth | 18 | 44.4 | +12.7% | 10.0% | −9.4 / +5.4 | +10.0 | −10.7 / 17.1 | 16/20, +8.2 / 13.1 |
+| start15 | 60d, top 3, 3d, abs, VT, breadth | 36 | 50.0 | +8.1% | 21.9% | −6.0 / +17.6 | +1.5 | −5.4 / 25.9 | 14/20, +10.5 / 21.0 |
+| start30 | 30d, top 3, 3d, abs, VT, breadth | 44 | 47.7 | −0.8% | 21.9% | −4.6 / +30.4 | −7.0 | +9.5 / 24.2 | 7/20, −1.7 / 22.5 |
+| sector20 | 90d, top 3, 7d, VT, breadth | 27 | 51.9 | +30.9% | 14.0% | −2.8 / +17.8 | +27.1 | +9.0 / 17.2 | 10/20, +1.5 / 16.7 |
+| l1_payments10 | consensus, top 1, 3d, VT, breadth | 12 | 50.0 | +15.4% | 21.8% | −15.4 / +36.4 | +9.2 | +50.5 / 18.3 | 20/20, +30.5 / 26.2 |
+| defi10 | 30d, top 3, 3d, abs, VT, breadth | 43 | 41.9 | +21.0% | 18.6% | −10.1 / +34.7 | +14.5 | +47.2 / 18.0 | 16/20, +15.6 / 21.2 |
+| *today20 (biased, look-ahead)* | 30d, top 2, 7d, abs, breadth | 20 | 75.0 | *+271.6%* | 16.6% | | | +251.1 / 24.5 | 20/20, +115.6 / 16.7 |
+| *Hold USD* | | 0 | | 0.0% | 0% | | | | |
+| *Buy & hold BTC* | | | | −21.5% | 53.1% | −35.4 / +21.0 | | | |
+| *Equal-weight hold: cur10 / orig5* | | | | −21.2% / −17.0% | 69.6% / 72.4% | | | | |
+| *Equal-weight hold: dyn20 / dyn30 list at test start* | | | | −43.3% / −49.2% | 74.1% / 75.0% | | | | |
+
+In the train period, BTC buy-and-hold made +554%, while equal-weight holds made +365%
+(cur10), +213% (dyn20 list) and +172% (dyn30 list).
+
+### What this shows
+- **Expanding the universe by objective rules made momentum worse, not better.**
+  - Every point-in-time universe scored below `cur10` on test return/DD, on its top-20
+    median, or on the Kraken check.
+  - Most failed all three.
+  - In mid-2025, the most liquid coins after the majors were memecoins on a hype spike
+    (MOODENG, TRUMP, PEPE, WIF, TOSHI, DEGEN, PNUT, POPCAT). They then collapsed. The
+    equal-weight hold of the test-start top-20 lost 43%.
+- **`dyn20` (+75%) and `l1_payments10` (Kraken +50.5%) look good but aren't robust.**
+  - `dyn20` came from **7 trades**, made all its money in the first half, and had a **62%**
+    train drawdown.
+  - `l1_payments10`'s chosen set made only +15% on Coinbase data. Its Kraken result
+    differs by 35 points, which shows how sensitive these results are to data source.
+- **`sector20` (+31% / 14% DD)** was not robust: only 10 of its top-20 train sets were
+  positive on test, with a median of +1.5%.
+- **The current 10 coins are themselves partly a hindsight choice.**
+  - In train, the cur10 basket beat the objectively defined top-20 by about 150 points.
+  - The `today20` list, picked with today's knowledge, "made" +272%.
+  - So part of momentum's +36–40% on `cur10` probably comes from knowing which coins
+    survived and were worth trading. Live results should be expected to be weaker.
+- **Post-hoc sensitivity checks** (`--sensitivity`; picked after seeing the results above,
+  so not candidates):
+  - Ranking by 90-day instead of 30-day volume: dyn10 +3.9%, dyn15 −3.0%, dyn20 +3.4%.
+  - Requiring 365 days of listing: dyn10 +20.1% / 24.5%, dyn15 +23.2% / 18.8% (Kraken +24%
+    with 8–9% DD).
+  - dyn15, no memes, 90-day volume: +27.5% / 10.7%, from just 7 trades (Kraken +25.6% /
+    20.4%).
+  - A mature, non-meme liquid list holds up better than a raw liquidity rank, but none beat
+    `cur10`, and I picked these variants after seeing the data.
+
+### Drawdown reducers (one change at a time, test return / max DD)
+- **Volatility-targeted sizing (60% annualised) is the one reducer that works everywhere.**
+  - It lowered both the train and the test drawdown in all 14 universes.
+  - On `cur10`, vol-target 60% vs off: train DD 27.5% vs 34.7%, test +35.9% / 22.4% vs
+    +42.6% / 29.0%.
+  - On the previous cur10 set: +34.6% / 21.5% vs +39.7% / 28.2%.
+  - The train grid picked it for 11 of 14 universes.
+  - **Note:** it gives up some return for the lower drawdown; the trade-off varies by
+    universe.
+- **2-of-3 consensus:** mixed. It lowered DD in dyn30 (12.7% vs 18.3%) and hurt sector20
+  (−7% vs +31%).
+- **Breadth filter:** mixed.
+  - On cur10 it changed +35.9% / 22.4% to +45.2% / 20.1% on test, but train DD rose to 38%.
+  - It helped the large universes (dyn30: +22% vs +7% without it).
+- **20% per-coin cap / 50% exposure:** these cut drawdown roughly in proportion to return.
+  - cur10 with 50% exposure: +23.0% / 14.6%. With a 20% cap: +22.9% / 15.5%.
+  - They are the simplest dial if the owner wants momentum with smaller swings.
+
+### Recommendation
+- **Don't expand the coin list.** No liquidity-defined universe was clearly better or
+  robust, and the apparent winners came from too few trades or from hindsight lists.
+- If the owner wants momentum anyway, the most defensible setup is:
+  - Coins: the **current 10** (SOL, AVAX, DOGE, NEAR, SUI, BTC, ETH, XRP, LINK, ADA).
+  - Selection: **consensus** of 30/60/90-day returns, **top 2**.
+  - Rebalance **weekly**, with the absolute-momentum filter on.
+  - **Vol-targeted sizing at 60%**, and only while BTC is above its 200-day MA.
+  - Expected profile: test **+35.9% with a 22.4% max DD** (Kraken +36.0% / 22.4%;
+    +30.7% with taker fees and 0.3% slippage). Train: +288% with a 27.5% DD.
+  - For smaller swings, set exposure to 50% (≈ +23% / 15% in test).
+  - Expect less live, because of the coin-selection bias described above.
+- This was **not implemented**, because the "clearly better" condition wasn't met. It would
+  reuse the multi-position machinery from the `trend` preset (positions, portfolio fills,
+  reconcile, mode guard, DRY_RUN), so it is a modest change if requested.
+
+### Files
+- `universe_data.py` (new): fetches the public data into `data/universe/`, which is
+  git-ignored. It needs no API keys.
+- `portfolio_backtest.py`:
+  - New functions: `universe_mask()`, `momentum_select()` (including the consensus rule) and
+    `momentum_weight()` (vol targeting and cap).
+  - `momentum_sim()` gains a universe mask, breadth filter, exposure and slippage stress.
+  - Earlier momentum results are unchanged.
+  - Coins with data gaps are valued at their last price.
+- `optimize.py universes [--sensitivity] [--out file]`.
+- `tests/test_offline.py`: 10 new checks, 99 in total. They cover:
+  - no look-ahead in the universe ranking
+  - the 90-day listing rule
+  - frozen lists, exclusions and the sector cap
+  - the consensus rule
+  - vol-target sizing, including not buying when volatility is unknown
+  - the breadth filter
+
+### Caveats
+- **Survivorship:** the pool is today's listings, so coins delisted since 2023 are missing.
+  Kraken's volume history only goes back 720 days, so the train period ranks by Coinbase
+  volume, which over-weights Coinbase-specific meme activity.
+- **One test regime:** a falling market for most of the window, then a rebound.
+- **Small samples:** 7–44 test trades per universe, with very wide spreads between
+  neighbouring settings and between the Coinbase and Kraken data.
+- **Modelled fills:** fills at the next open with maker fees, but small-cap coins may fill
+  worse. The taker + 0.3% stress covers part of that.
