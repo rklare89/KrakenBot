@@ -407,9 +407,148 @@ def compare(args, new_params=None):
     apply_params(baseline)
 
 
+# ============================================================================= alternative strategies
+# Portfolio-level research for trend-following and momentum rotation (portfolio_backtest.py).
+TREND_AXES = {'entry_days': [20, 30, 55], 'ma_days': [0, 100, 200], 'atr_mult': [None, 2, 3, 4, 6],
+              'exit_days': [None, 10, 20], 'regime': [False, True], 'k': [1, 3, 5, 10]}
+MOM_AXES = {'lookback_days': [30, 60, 90], 'top_k': [1, 2, 3], 'rebalance_days': [3, 7, 14],
+            'abs_filter': [False, True], 'regime': [True]}   # spec: only hold coins while BTC > 200d MA
+STRAT_CATEGORICAL = ('regime', 'abs_filter')
+# atr_mult/exit_days "None" (off) is ordered as the loosest end of each axis for neighbour purposes
+
+
+def _panels(tf, source='coinbase'):
+    import portfolio_backtest as pb
+    syms = WATCH + EXTRA
+    if source == 'coinbase':
+        raw = {b: resample(pd.read_csv(f'{DATA_DIR}/coinbase_{b}_1h.csv'), tf) for b in syms}
+    else:
+        raw = {b: pd.read_csv(f'{DATA_DIR}/kraken_{b}_{tf}.csv').iloc[:-1].reset_index(drop=True) for b in syms}
+    bpd = 86400 // app.ccxt.Exchange.parse_timeframe(tf)
+    return {'10': pb.Panel(raw, raw['BTC'], bpd), '5': pb.Panel({b: raw[b] for b in WATCH}, raw['BTC'], bpd)}
+
+
+def _strat_run(args_):
+    import portfolio_backtest as pb
+    kind, p, ranges, fees = args_
+    fn = pb.trend_sim if kind == 'trend' else pb.momentum_sim
+    out = {}
+    for name, (panel_key, lo, hi) in ranges.items():
+        out[name] = fn(_G['panels'][panel_key], p, lo, hi, *fees)
+    return p, out
+
+
+def _strat_init(panels):
+    _G['panels'] = panels
+
+
+def _strat_score(m, min_trades=10):
+    if m['trades'] < min_trades:
+        return -1e9
+    return m['return_pct'] / max(m['max_dd'], 5.0)      # Calmar-like (same period for all sets)
+
+
+def _strat_neighbours(p, axes):
+    out = []
+    for k_, vals in axes.items():
+        if k_ in STRAT_CATEGORICAL:
+            continue
+        i = vals.index(p[k_])
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(vals):
+                out.append(key({**p, k_: vals[j]}))
+    return out
+
+
+def strategies(args):
+    import portfolio_backtest as pb
+    cut = set_cutoff(load('coinbase', '4h', WATCH + EXTRA))
+    print('train < ', pd.Timestamp(cut, unit='ms').date(), '<= test')
+    results = {}
+    for kind, tf in (('trend', '1d'), ('trend', '4h'), ('momentum', '1d')):
+        if args.only and args.only != f'{kind}_{tf}':
+            continue
+        panels = _panels(tf)
+        end = int(panels['10'].ts[-1]) + 1
+        mid = cut + (end - cut) // 2
+        axes = TREND_AXES if kind == 'trend' else MOM_AXES
+        grid = [dict(zip(axes, v)) for v in itertools.product(*axes.values())]
+        if kind == 'trend':
+            grid = [g for g in grid if g['atr_mult'] or g['exit_days']]      # need some exit
+        ranges = {'train': ('10', None, cut)}
+        t0 = time.time()
+        with Pool(args.procs, initializer=_strat_init, initargs=(panels,)) as pool:
+            res = pool.map(_strat_run, [(kind, p, ranges, (pb.MAKER_FEE, pb.TAKER_FEE)) for p in grid], chunksize=8)
+        sc = {key(p): _strat_score(o['train']) for p, o in res}
+
+        def robust(p):
+            vals = [sc[key(p)]] + [sc[n] for n in _strat_neighbours(p, axes) if n in sc]
+            return float(np.mean(vals)) if min(vals) > -1e8 else -1e9
+        ranked = sorted(res, key=lambda r: robust(r[0]), reverse=True)
+        best = ranked[0][0]
+        print(f'\n=== {kind} {tf}: {len(grid)} sets in {time.time() - t0:.0f}s; top 5 by neighbour-smoothed TRAIN score')
+        for p, o in ranked[:5]:
+            m = o['train']
+            print(f"  {json.dumps(p)}  robust {robust(p):.2f} | train ret {m['return_pct']}% dd {m['max_dd']}% trades {m['trades']}")
+        # evaluate the chosen set once out-of-sample
+        evals = {'train': ('10', None, cut), 'test': ('10', cut, None), 'test1': ('10', cut, mid),
+                 'test2': ('10', mid, None), 'test [5 coins]': ('5', cut, None), 'train [5 coins]': ('5', None, cut)}
+        _G['panels'] = panels
+        _, o = _strat_run((kind, best, evals, (pb.MAKER_FEE, pb.TAKER_FEE)))
+        _, st = _strat_run((kind, best, {'test all-taker': ('10', cut, None)}, (pb.TAKER_FEE, pb.TAKER_FEE)))
+        o.update(st)
+        try:
+            kp = _panels(tf, 'kraken')
+            _G['panels'] = kp
+            _, ko = _strat_run((kind, best, {'kraken (test window)': ('10', cut, None),
+                                             'kraken [5 coins]': ('5', cut, None)}, (pb.MAKER_FEE, pb.TAKER_FEE)))
+            o.update(ko)
+        except FileNotFoundError:
+            pass
+        # how many of the top-20 train sets are positive out-of-sample (selection stability)
+        _G['panels'] = panels
+        oos = [_strat_run((kind, p, {'test': ('10', cut, None)}, (pb.MAKER_FEE, pb.TAKER_FEE)))[1]['test']
+               for p, _ in ranked[:20]]
+        o['top20_test_positive'] = sum(1 for m in oos if m['return_pct'] > 0)
+        o['top20_test_median_ret'] = float(np.median([m['return_pct'] for m in oos]))
+        results[f'{kind}_{tf}'] = {'params': best, 'eval': o}
+        print(f'  chosen: {json.dumps(best)}')
+        for part, m in o.items():
+            if isinstance(m, dict):
+                print(f"   {part:22s} trades {m['trades']:4d} win {m['win_rate']:5.1f}% ret {m['return_pct']:8.2f}% "
+                      f"maxDD {m['max_dd']:6.2f}% fees {m['fees_pct']:5.2f}% days {m['days']}")
+        print(f"   top-20 train sets: {o['top20_test_positive']}/20 positive on test; median test ret {o['top20_test_median_ret']:.2f}%")
+
+    # benchmarks (daily bars) + RSI presets (4h, live-like rotation)
+    panels = _panels('1d')
+    end = int(panels['10'].ts[-1]) + 1
+    mid = cut + (end - cut) // 2
+    btc = panels['10'].coins.index('BTC')
+    print('\n=== benchmarks (100% invested at the period start, maker fee in/out)')
+    for name, (lo, hi) in {'train': (None, cut), 'test': (cut, None), 'test1': (cut, mid), 'test2': (mid, None)}.items():
+        b1 = pb.buy_hold(panels['10'], [btc], lo, hi)
+        b10 = pb.buy_hold(panels['10'], list(range(10)), lo, hi)
+        b5 = pb.buy_hold(panels['5'], list(range(5)), lo, hi)
+        print(f"   {name:6s} BTC: ret {b1['return_pct']:8.2f}% maxDD {b1['max_dd']:6.2f}% | EW10: ret {b10['return_pct']:8.2f}% "
+              f"maxDD {b10['max_dd']:6.2f}% | EW5: ret {b5['return_pct']:8.2f}% maxDD {b5['max_dd']:6.2f}%")
+        results.setdefault('benchmarks', {})[name] = {'btc': b1, 'ew10': b10, 'ew5': b5}
+    for preset in ('conservative', 'tuned_a'):
+        p = dict(OLD_PARAMS, **{k_: v for k_, v in app.STRATEGY_PRESETS[preset].items() if k_ in PARAM_KEYS})
+        apply_params(p)
+        for label, syms in (('10', WATCH + EXTRA), ('5', WATCH)):
+            full = load('coinbase', '4h', syms)
+            r = portfolio_sim({b: split(d, 'test') for b, d in full.items()}, '4h')
+            print(f"   RSI {preset:12s} [{label} coins] test: trades {r['trades']} win {r['win_rate']}% ret {r['return_pct']}% maxDD {r['max_dd']}%")
+            results.setdefault('rsi', {})[f'{preset}_{label}'] = r
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(results, f, indent=1, default=str)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['fetch', 'tune', 'compare'])
+    ap.add_argument('cmd', choices=['fetch', 'tune', 'compare', 'strategies'])
     ap.add_argument('--timeframe', default='4h')
     ap.add_argument('--extras', action='store_true', help='tune on watchlist + BTC/ETH/XRP/LINK/ADA')
     ap.add_argument('--procs', type=int, default=os.cpu_count() or 2)
@@ -417,6 +556,7 @@ def main():
     ap.add_argument('--min-trades', type=int, default=0)
     ap.add_argument('--out', default=None)
     ap.add_argument('--verbose', action='store_true')
+    ap.add_argument('--only', default=None, help='strategies: trend_1d | trend_4h | momentum_1d')
     ap.add_argument('--max-stop', type=float, default=None, help='only consider STOP_LOSS_PCT <= this')
     ap.add_argument('--max-hold', type=int, default=None, help='only consider MAX_HOLD_HOURS <= this')
     args = ap.parse_args()
@@ -425,6 +565,8 @@ def main():
     elif args.cmd == 'tune':
         best = tune(args)
         compare(args, best)
+    elif args.cmd == 'strategies':
+        strategies(args)
     else:
         compare(args)
 

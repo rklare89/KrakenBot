@@ -361,6 +361,36 @@ bad = {'Authorization': 'Basic ' + base64.b64encode(b'admin:nope').decode()}
 check("dashboard 401 with wrong password", client.get('/', headers=bad).status_code == 401)
 check("default dashboard host is 127.0.0.1", bot.DASHBOARD_HOST == '127.0.0.1')
 
+
+# 13) portfolio_backtest.py (trend / momentum engines) on synthetic daily data
+import portfolio_backtest as pb
+day = 86_400_000
+def daily(closes, t0=1_672_531_200_000):
+    c = np.asarray(closes, dtype=float); o = np.concatenate([[c[0]], c[:-1]])
+    return pd.DataFrame({"timestamp": t0 + np.arange(len(c)) * day, "open": o, "high": np.maximum(o, c) * 1.005,
+                         "low": np.minimum(o, c) * 0.995, "close": c, "volume": 1.0})
+flat_then_up = [100.0] * 60 + list(100 * 1.01 ** np.arange(1, 41)) + list(100 * 1.01 ** 40 * 0.97 ** np.arange(1, 21))
+dfs = {"UP": daily(flat_then_up), "FLAT": daily([50.0] * 120), "DOWN": daily(list(np.linspace(80, 40, 120)))}
+panel = pb.Panel(dfs, dfs["UP"], 1)
+tp = dict(entry_days=20, ma_days=0, atr_mult=3, exit_days=None, regime=False, k=1)
+m = pb.trend_sim(panel, tp)
+check("trend: breakout entered and closed by ATR stop", m['trades'] == 1 and m['return_pct'] > 0)
+m2 = pb.trend_sim(panel, dict(tp, atr_mult=None, exit_days=10))
+check("trend: Donchian-low exit works", m2['trades'] == 1)
+m3 = pb.trend_sim(panel, dict(tp, ma_days=200))
+check("trend: MA filter without enough history blocks entries", m3['trades'] == 0)
+acct = pb.Account(); acct.buy(0, 100.0, 800.0); acct.sell(0, 100.0, taker=True, slippage=0.001)
+check("account: fees + slippage charged", abs(acct.cash - (1000 - 800 + 800 * 0.9975 * 0.999 * 0.996)) < 1e-9)
+check("momentum_targets: ranking, abs filter, regime",
+      pb.momentum_targets(np.array([0.1, np.nan, 0.3, -0.2]), True, 2, False) == [2, 0]
+      and pb.momentum_targets(np.array([-0.1, -0.3]), True, 2, True) == []
+      and pb.momentum_targets(np.array([0.1, 0.3]), False, 1, False) == [])
+mp = dict(lookback_days=10, top_k=1, rebalance_days=7, abs_filter=True, regime=False)
+mm = pb.momentum_sim(panel, mp)
+check("momentum: rotates into the rising coin and profits", mm['trades'] >= 1 and mm['return_pct'] > 0)
+bh = pb.buy_hold(panel, [2])
+check("buy-and-hold benchmark loses on the falling coin", bh['return_pct'] < -45)
+
 # 12) shipped defaults are valid and the backtest runs with them
 for _k, _v in SHIPPED.items():
     setattr(bot, _k, _v)
