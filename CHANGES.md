@@ -67,7 +67,7 @@ to `bot_state.dryrun.json` and `trade_ledger.dryrun.json`. No API keys are neede
 is still **live** trading, as before.
 
 ## New env vars
-`STRATEGY_PRESET` (conservative | tuned_a | trend; see the tuning and alternative-strategies sections), `DRY_RUN`, `DRY_RUN_USD_BALANCE`, `DASHBOARD_HOST` (default 127.0.0.1), `DASHBOARD_PORT` (5000),
+`STRATEGY_PRESET` (conservative | tuned_a | trend | momentum; see the tuning, alternative-strategies and momentum sections), `DRY_RUN`, `DRY_RUN_USD_BALANCE`, `DASHBOARD_HOST` (default 127.0.0.1), `DASHBOARD_PORT` (5000),
 `DASHBOARD_USER` (admin), `DASHBOARD_PASSWORD` (unset = no auth). `KRAKEN_API_KEY` and
 `KRAKEN_SECRET_KEY` are unchanged.
 
@@ -531,3 +531,126 @@ In the train period, BTC buy-and-hold made +554%, while equal-weight holds made 
   neighbouring settings and between the Coinbase and Kraken data.
 - **Modelled fills:** fills at the next open with maker fees, but small-cap coins may fill
   worse. The taker + 0.3% stress covers part of that.
+
+## Momentum preset (Oct 2026): opt-in `STRATEGY_PRESET=momentum`
+
+The owner approved momentum rotation as an **opt-in** preset with the recommended settings.
+The default is still `conservative`.
+
+### What it does
+- **Coins:** SOL, AVAX, DOGE, NEAR, SUI, BTC, ETH, XRP, LINK, ADA, on Kraken daily candles.
+- **Daily ranking:** once per closed daily candle (00:00 UTC), it ranks the coins by 30-, 60-
+  and 90-day return.
+  - A coin qualifies if it is in the **top 2 on at least 2 of the 3 lookbacks**.
+  - It also needs a **positive return on at least 2 of 3** (absolute filter).
+- **Weekly rebalance (every 7 days):**
+  - It holds the top 2 qualifiers.
+  - Each gets **80% / 2 × min(1, 60% / its 30-day annualised volatility)** of equity, so at
+    most 40% per coin and 80% in total.
+  - Coins that drop out are sold.
+  - A coin that stays selected is **not resized**, unless it has fallen more than 50% below
+    its target weight (`MOMENTUM_REBALANCE_DRIFT`). Then it is topped up.
+  - Winners are never trimmed: trimming cost about 90 points in the train period.
+  - A buy never takes holdings above 80% of equity (`MOMENTUM_MAX_INVESTED`).
+  - Orders under $10 are skipped.
+- **Regime filter:** if BTC/USD closes below its 200-day MA (checked daily), everything is sold
+  and queued buys are cancelled. The bot holds USD until the next rebalance after BTC
+  recovers. A regime exit does not move the weekly schedule.
+- **Orders:**
+  - Exits go first. Buys wait until every exit has filled, because they need the USD.
+  - Both start as **post-only** limits (sells at the ask, buys at the bid). After 4 unfilled
+    attempts (`MOMENTUM_ORDER_MAX_ATTEMPTS`) they fall back to a **marketable limit**:
+    - sells at bid − `STOP_LOSS_MAX_SLIPPAGE_PCT`
+    - buys at ask + the same slippage, capped 5% above the signal close
+  - A queued buy is dropped if price has run more than 5% above the signal close
+    (`MOMENTUM_MAX_ENTRY_CHASE_PCT`).
+  - If a coin's daily candle is late, the bot waits up to 2 hours (`MOMENTUM_DATA_GRACE_SEC`)
+    before ranking without it.
+- **Safety features carried over from `trend`:**
+  - Positions live in `state["positions"]` (atomic writes), tagged `"mode": "momentum"`.
+  - Fills come from actual order data (partial fills and dust handled).
+  - Every order is recorded as `pending_order` (with `strategy: momentum`) before it is sent,
+    and recovered on the next loop or at startup.
+  - Startup reconcile checks each position against balances.
+  - `DRY_RUN` uses the paper wallet.
+  - Dashboard auth is unchanged.
+- **Mode guard:** the bot refuses to trade if it finds positions from another mode. That
+  means RSI, trend and momentum guard against each other. Trend positions created before
+  this change have no tag and count as trend.
+- **Dashboard:** a momentum card shows:
+  - the BTC regime (close vs 200-day MA)
+  - targets, holdings, queued buys and the next rebalance
+  - a rank table: 30/60/90-day returns, top-2 votes, 30-day volatility and target weight
+  - The scanner thread refreshes the ranks hourly from public data, even before the first
+    trade.
+- **New constants:**
+  - `MOMENTUM_LOOKBACKS` (30, 60, 90), `MOMENTUM_TOP_K` (2), `MOMENTUM_REBALANCE_DAYS` (7)
+  - `MOMENTUM_ABS_FILTER` (True), `MOMENTUM_REGIME_FILTER` (True), `MOMENTUM_REGIME_MA_DAYS` (200)
+  - `MOMENTUM_VOL_TARGET` (0.60), `MOMENTUM_VOL_DAYS` (30)
+  - `MOMENTUM_EXPOSURE` (0.80), `MOMENTUM_MAX_WEIGHT` (None), `MOMENTUM_MAX_INVESTED` (0.80)
+  - `MOMENTUM_REBALANCE_DRIFT` (0.5)
+  - `MOMENTUM_MAX_ENTRY_CHASE_PCT` (0.05), `MOMENTUM_ORDER_MAX_ATTEMPTS` (4), `MOMENTUM_DATA_GRACE_SEC` (7200)
+  - `STRATEGY_MODE` now accepts `'momentum'`.
+
+### One codebase for live trading and the backtest
+- **Shared code:** the ranking and sizing code lives in `app.py` and is used unchanged by
+  `portfolio_backtest.momentum_sim`. That covers `momentum_returns`, `momentum_volatility`,
+  `sma_regime`, `momentum_select` (consensus), `momentum_weight` (vol targeting and cap),
+  `momentum_exits`, and `momentum_buys` (drift band and 80% cap).
+- **Mapping:** `app.momentum_backtest_params()` turns the live settings into backtest
+  parameters. `python optimize.py momentum_check` runs them.
+- **Test:** checks that the live snapshot picks the same coins with the same weights as the
+  backtester on identical candles.
+
+| Configuration (out-of-sample, 12 Jun 2025 – 5 Oct 2026) | Trades | Win % | Net return | Max DD | Kraken data | Taker + 0.3% | Train (Jan 2023 – Jun 2025) |
+|---|---|---|---|---|---|---|---|
+| Research set (universes study), rerun on the refactored shared code | 14 | 57.1 | **+35.89%** | **22.41%** | +36.03% / 22.42% | +30.70% | +288.46% / 27.53% DD |
+| **Live preset as shipped** (adds the 80% cap at buy time and the 50% top-up band) | 14 | 57.1 | **+35.46%** | **22.42%** | +35.60% / 22.42% | +30.33% | +289.65% / 26.51% DD |
+
+The research numbers are reproduced exactly. The shipped configuration differs only by the
+explicit 80% cap, which occasionally trims a buy when a held winner has grown. The 50%
+top-up band never triggered in this history. The earlier momentum, trend and universe
+results are unchanged.
+
+### Checks run
+- `py_compile` passes on all modules.
+- `tests/test_offline.py` has **129/129** passing under `STRATEGY_PRESET=conservative`,
+  `tuned_a`, `trend` and `momentum`, with sockets blocked. The 30 new momentum checks cover:
+  - Ranking:
+    - live-vs-backtest parity
+    - the vol-targeted weights
+    - post-only buys and their sizing
+  - Rebalancing:
+    - mode tagging
+    - no trades between rebalances
+    - rotation with exits before buys, and post-only exits falling back to marketable limits
+    - buy fallbacks and the chase limit
+    - the 80% cap and $10 minimum
+    - the drift band and no trimming
+  - Regime filter:
+    - the regime-off liquidation, and the schedule staying put
+  - Safety:
+    - recovery of a network-error buy
+    - reconcile
+    - all three mode-guard directions
+    - DRY_RUN with no orders sent
+  - Dashboard: the momentum card renders.
+- I also ran a DRY_RUN smoke test on Kraken's **public** data (no keys, no orders). One live
+  loop ranked the 10 real coins, picked NEAR and SUI (BTC above its 200-day MA), and sized
+  them at 16.8% and 22.0% for volatility. It paper-bought both and rendered the dashboard.
+
+### Caveats
+- **Hindsight in the coin list.** The 10 coins were picked with hindsight (see the universe
+  study above): liquidity-defined lists did much worse. Treat +35% / 22% DD as an optimistic
+  estimate.
+- **Big swings.** Drawdowns of 20–30% are normal for this strategy. It holds only 1–2
+  correlated coins, and the train period also had a 27% drawdown.
+- **Few, lumpy trades.** About 14 trades in 16 months. The first half of the test period was
+  roughly flat (+2.4%).
+- **Fills are modelled at the next open.** Live orders go in right after the daily close as
+  post-only. Fast moves can trigger the marketable fallback (taker fee) or the 5% chase skip,
+  which the backtest doesn't model.
+- **Untested against the real API.** The multi-position code is tested offline and in DRY_RUN
+  only, never with real Kraken orders or keys. Run DRY_RUN for a few weeks first.
+- **Small accounts.** Orders must be at least $10. A small account leaves the low-weight coin
+  below the minimum.
