@@ -75,9 +75,7 @@ class Panel:
     def ret(self, days):
         k = ('ret', days)
         if k not in self._cache:
-            n = int(days * self.bpd)
-            c = pd.DataFrame(self.C)
-            self._cache[k] = (c / c.shift(n) - 1).to_numpy()
+            self._cache[k] = app.momentum_returns(pd.DataFrame(self.C), days, self.bpd).to_numpy()
         return self._cache[k]
 
     def atr(self, period=14):
@@ -106,9 +104,7 @@ class Panel:
         """Annualised std of log returns over `days`."""
         k = ('vol', days)
         if k not in self._cache:
-            n = int(days * self.bpd)
-            lr = np.log(pd.DataFrame(self.C)).diff()
-            self._cache[k] = (lr.rolling(n, min_periods=n).std() * np.sqrt(365 * self.bpd)).to_numpy()
+            self._cache[k] = app.momentum_volatility(pd.DataFrame(self.C), days, self.bpd).to_numpy()
         return self._cache[k]
 
     def above_sma(self, days=50):
@@ -120,9 +116,7 @@ class Panel:
     def btc_regime(self, days=200):
         k = ('regime', days)
         if k not in self._cache:
-            n = int(days * self.bpd)
-            ma = pd.Series(self.btc).rolling(n, min_periods=n).mean().to_numpy()
-            self._cache[k] = self.btc > ma          # False while MA is NaN
+            self._cache[k] = app.sma_regime(pd.Series(self.btc), days, self.bpd).to_numpy()   # False while MA is NaN
         return self._cache[k]
 
 
@@ -144,6 +138,32 @@ class Account:
         self.cash -= usd
         self.fees += fee
         return True
+
+    def add(self, j, px, usd):
+        """Top up an existing holding (maker fee)."""
+        usd = min(usd, self.cash)
+        if usd < MIN_TRADE_USD or not np.isfinite(px) or px <= 0:
+            return False
+        fee = usd * self.maker
+        p = self.pos[j]
+        p['qty'] += (usd - fee) / px
+        p['cost'] += usd
+        self.cash -= usd
+        self.fees += fee
+        return True
+
+    def reduce(self, j, px, usd, slippage=0.0):
+        """Sell `usd` worth of an existing holding (maker fee); the round trip's P&L is
+        booked when the rest is sold."""
+        p = self.pos[j]
+        fill = px * (1 - slippage)
+        qty = min(usd / fill, p['qty'])
+        gross = qty * fill
+        fee = gross * self.maker
+        p['qty'] -= qty
+        p['cost'] -= gross - fee
+        self.cash += gross - fee
+        self.fees += fee
 
     def sell(self, j, px, taker=False, slippage=0.0):
         p = self.pos.pop(j)
@@ -249,56 +269,15 @@ def trend_sim(panel, p, start_ms=None, end_ms=None, maker=MAKER_FEE, taker=TAKER
 
 
 # ----------------------------------------------------------------------------- momentum
-def momentum_targets(rets_row, regime_ok, top_k, abs_filter):
-    """Shared ranking rule: indices of the top_k coins by lookback return (NaN skipped);
-    empty if the BTC regime is off; optional absolute-momentum filter (return > 0)."""
-    if not regime_ok:
-        return []
-    order = [j for j in np.argsort(-np.nan_to_num(rets_row, nan=-np.inf)) if np.isfinite(rets_row[j])]
-    if abs_filter:
-        order = [j for j in order if rets_row[j] > 0]
-    return order[:top_k]
-
-
+# Ranking and sizing are the live bot's own functions (app.py), so the backtest and the
+# live 'momentum' loop cannot drift apart.
+momentum_targets = app.momentum_targets
+momentum_select = app.momentum_select
 MOM_CONSENSUS_LOOKBACKS = (30, 60, 90)
 
 
-def momentum_select(rets_rows, regime_ok, top_k, abs_filter, mask=None):
-    """Generalised ranking. rets_rows: list of 1 or 3 return rows (lookbacks).
-    One lookback -> momentum_targets(). Three -> 'consensus': a coin qualifies if it is in
-    the top_k on at least 2 of the 3 lookbacks (ordered by mean rank); the absolute filter
-    then needs a positive return on at least 2 of 3. mask: coins allowed (universe)."""
-    if not regime_ok:
-        return []
-    rows = [np.where(mask, r, np.nan) if mask is not None else r for r in rets_rows]
-    if len(rows) == 1:
-        return momentum_targets(rows[0], True, top_k, abs_filter)
-    votes, ranks = {}, {}
-    for r in rows:
-        order = [j for j in np.argsort(-np.nan_to_num(r, nan=-np.inf)) if np.isfinite(r[j])]
-        for pos, j in enumerate(order):
-            ranks.setdefault(j, []).append(pos)
-            if pos < top_k:
-                votes[j] = votes.get(j, 0) + 1
-    picks = [j for j, v in votes.items() if v >= 2 and len(ranks[j]) == len(rows)]
-    if abs_filter:
-        picks = [j for j in picks if sum(r[j] > 0 for r in rows) >= 2]
-    picks.sort(key=lambda j: np.mean(ranks[j]))
-    return picks[:top_k]
-
-
 def momentum_weight(top_k, vol=None, vol_target=None, max_weight=None, exposure=EXPOSURE):
-    """Fraction of equity for one new holding: exposure/top_k, scaled down by
-    vol_target/vol when volatility targeting is on (0 if volatility is unknown), capped
-    at max_weight."""
-    w = exposure / top_k
-    if vol_target:
-        if vol is None or not np.isfinite(vol) or vol <= 0:
-            return 0.0                      # volatility unknown -> don't buy (conservative)
-        w *= min(1.0, vol_target / vol)
-    if max_weight:
-        w = min(w, max_weight)
-    return w
+    return app.momentum_weight(top_k, vol, vol_target, max_weight, exposure)
 
 
 def universe_mask(panel, top_n=None, min_days=90, coins=None, exclude=(), sectors=None,
@@ -344,7 +323,9 @@ def momentum_sim(panel, p, start_ms=None, end_ms=None, maker=MAKER_FEE, taker=TA
                  universe=None, slippage=0.0):
     """p: lookback_days (int or 'cons'), top_k, rebalance_days, abs_filter (bool),
     regime (bool); optional vol_target (annualised, None = off), breadth (min share of
-    the universe above its 50-day SMA, 0 = off), max_weight (per-coin cap), exposure.
+    the universe above its 50-day SMA, 0 = off), max_weight (per-coin cap), exposure,
+    drift / trim / max_invested (see app.momentum_buys; drift None = never resize, which
+    is how the research grid ran).
     universe: optional T x n mask from universe_mask(). slippage: applied to every fill
     (stress tests). Rotation fills at the next open with the maker fee."""
     O, C = panel.O, panel.C
@@ -370,15 +351,27 @@ def momentum_sim(panel, p, start_ms=None, end_ms=None, maker=MAKER_FEE, taker=TA
                 live = (u if u is not None else np.ones(C.shape[1], bool)) & np.isfinite(C[t - 1])
                 if not live.any() or above[t - 1][live].mean() < br:
                     target = []
-            for j in [j for j in acct.pos if j not in target]:
+            for j in app.momentum_exits(list(acct.pos), target):
                 if np.isfinite(O[t, j]):
                     acct.sell(j, O[t, j], slippage=slippage)
-            new = [j for j in target if j not in acct.pos]
-            if new:
+            drift = p.get('drift')
+            if target and (drift is not None or any(j not in acct.pos for j in target)):
                 equity = acct.equity(C[t - 1])
-                for j in new:
-                    w = momentum_weight(p['top_k'], vol[t - 1, j] if vt else None, vt, p.get('max_weight'), expo)
-                    acct.buy(j, O[t, j] * (1 + slippage), equity * w)
+                weights = {j: momentum_weight(p['top_k'], vol[t - 1, j] if vt else None, vt,
+                                              p.get('max_weight'), expo) for j in target}
+                held = {j: acct.pos[j]['qty'] * (C[t - 1, j] if np.isfinite(C[t - 1, j]) else acct.pos[j]['entry_px'])
+                        for j in acct.pos}
+                orders = app.momentum_buys(held, target, weights, equity, drift, MIN_TRADE_USD,
+                                           trim=p.get('trim', False), max_invested=p.get('max_invested'))
+                for j, usd in orders.items():
+                    if not np.isfinite(O[t, j]):
+                        continue
+                    if j not in acct.pos:
+                        acct.buy(j, O[t, j] * (1 + slippage), usd)
+                    elif usd > 0:
+                        acct.add(j, O[t, j] * (1 + slippage), usd)
+                    else:
+                        acct.reduce(j, O[t, j], -usd, slippage)
         for j in acct.pos:
             if np.isfinite(C[t, j]):
                 acct.pos[j]['last_px'] = C[t, j]

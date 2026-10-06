@@ -523,6 +523,214 @@ bot.DRY_RUN = False
 for k_, v_ in saved.items():
     setattr(bot, k_, v_)
 
+# 15) live 'momentum' mode (multi-coin fake exchange, network blocked)
+msaved = {k: getattr(bot, k) for k in dir(bot) if k.startswith("MOMENTUM_")}
+msaved.update(STRATEGY_MODE=bot.STRATEGY_MODE, WATCHLIST=bot.WATCHLIST, DRY_RUN=bot.DRY_RUN)
+MCOINS = ['SOL', 'ETH', 'BTC', 'ADA']
+class FakeMulti(FakeKraken):
+    def __init__(self, scenario):
+        super().__init__(scenario)
+        self.set_markets([{
+            'id': f'{c}USD', 'symbol': f'{c}/USD', 'base': c, 'quote': 'USD', 'baseId': c, 'quoteId': 'USD',
+            'active': True, 'spot': True, 'type': 'spot', 'precision': {'amount': 1e-8, 'price': 1e-4},
+            'limits': {'amount': {'min': 1e-4}, 'cost': {'min': 0.5}, 'price': {}, 'leverage': {}}} for c in MCOINS])
+        self.bal = {'USD': 1000.0, **{c: 0.0 for c in MCOINS}}
+    def fetch_ticker(self, symbol, params={}):
+        p = self.scenario['prices'][symbol]
+        return {'last': p, 'bid': p * 0.9995, 'ask': p * 1.0005}
+    def create_order(self, symbol, type, side, amount, price=None, params={}):
+        if self.scenario.get('create_network_error'):
+            self.scenario['create_network_error'] = False
+            raise ccxt.RequestTimeout("timeout")
+        oid = f"O{len(self.created)+1}"
+        self.created.append((symbol, type, side, amount, price, dict(params)))
+        frac = self.scenario.get('fill_frac', 1.0); filled = round(amount * frac, 8); base = symbol.split('/')[0]
+        o = {'id': oid, 'symbol': symbol, 'side': side, 'amount': amount, 'price': price,
+             'status': 'closed' if frac >= 1 else 'open', 'filled': filled, 'average': price if filled else None,
+             'cost': filled * price, 'fee': {'cost': filled * price * 0.0025, 'currency': 'USD'} if filled else None,
+             'info': {'userref': params.get('userref')}}
+        self.orders[oid] = o
+        if filled:
+            if side == 'buy': self.bal['USD'] -= filled * price * 1.0025; self.bal[base] += filled
+            else: self.bal[base] -= filled; self.bal['USD'] += filled * price * 0.9975
+        return dict(o)
+    def fetch_ohlcv(self, symbol, timeframe='1d', since=None, limit=None, params={}):
+        rows = self.scenario['ohlcv'][symbol]
+        return rows[-limit:] if limit else rows
+
+def wiggle(growth, amp, n=262, start=100.0):
+    i = np.arange(n)
+    return list(start * growth ** i * (1 + amp * np.where(i % 2, 1, -1)))
+def mscenario(series, nowms, **kw):
+    ohl = {f'{c}/USD': daily_ohlcv(v, nowms) for c, v in series.items()}
+    prices = {s: rows[-2][4] for s, rows in ohl.items()}          # last CLOSED close
+    return dict({'ohlcv': ohl, 'prices': prices, 'fill_frac': 1.0}, **kw)
+def mreset():
+    for f in (bot.STATE_FILE, bot.LEDGER_FILE):
+        if os.path.exists(f): os.remove(f)
+def miter(ex):
+    st = bot.load_state(); free, total = bot.get_balances(ex, st); bot.momentum_iteration(ex, st, free, total)
+    return bot.load_state()
+
+bot.STRATEGY_MODE = 'momentum'; bot.WATCHLIST = [f'{c}/USD' for c in MCOINS]
+for k_, v_ in bot.STRATEGY_PRESETS['momentum'].items():
+    if k_.startswith('MOMENTUM_'): setattr(bot, k_, v_)
+mreset()
+base_series = {'SOL': wiggle(1.006, 0.05), 'ETH': wiggle(1.004, 0.01), 'BTC': wiggle(1.002, 0.01), 'ADA': wiggle(0.998, 0.01)}
+ex = FakeMulti(mscenario(base_series, ex.milliseconds()))
+nowms = ex.milliseconds(); exp_bar = (nowms // bot.DAY_MS) * bot.DAY_MS - bot.DAY_MS
+snap = bot.momentum_snapshot(ex, exp_bar)
+check("momentum snapshot: regime on, top-2 consensus = SOL, ETH", snap['regime_ok'] is True
+      and snap['targets'] == ['SOL/USD', 'ETH/USD'] and snap['missing'] == [])
+# same ranking/sizing as the backtester on identical closes
+cl = {c: pd.DataFrame(daily_ohlcv(v, nowms)[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+      for c, v in base_series.items()}
+mpanel = pb.Panel(cl, cl['BTC'], 1)
+t_ = mpanel.T() - 1
+bt_targets = pb.momentum_select([mpanel.ret(d)[t_] for d in (30, 60, 90)], bool(mpanel.btc_regime(200)[t_]), 2, True)
+bt_w = {mpanel.coins[j]: pb.momentum_weight(2, mpanel.volatility(30)[t_, j], 0.6, None, 0.8) for j in bt_targets}
+check("momentum: live ranking and vol-targeted weights equal the backtester's",
+      [mpanel.coins[j] + '/USD' for j in bt_targets] == snap['targets']
+      and all(abs(bt_w[s.split('/')[0]] - w) < 1e-12 for s, w in snap['weights'].items()))
+check("momentum: volatile SOL gets a smaller vol-targeted weight, ETH the full 40%",
+      snap['weights']['SOL/USD'] < 0.2 and abs(snap['weights']['ETH/USD'] - 0.4) < 1e-12)
+st = miter(ex)
+buys = [c for c in ex.created if c[2] == 'buy']
+check("momentum rebalance: post-only buys of both targets at the bid",
+      sorted(c[0] for c in buys) == ['ETH/USD', 'SOL/USD'] and all(c[5].get('postOnly') for c in buys)
+      and all(abs(c[4] - ex.scenario['prices'][c[0]] * 0.9995) < 1e-3 for c in buys))
+usd_by = {c[0]: c[3] * c[4] for c in buys}
+check("momentum sizing: weight x equity ($1000), total <= 80%",
+      abs(usd_by['ETH/USD'] - 400) < 2 and abs(usd_by['SOL/USD'] - 1000 * snap['weights']['SOL/USD']) < 2
+      and sum(usd_by.values()) <= 800)
+check("momentum: positions tagged 'momentum', no stop, rebalance recorded",
+      all(p['mode'] == 'momentum' and p['stop'] is None for p in st['positions'].values())
+      and st['momentum']['last_rebalance'] == exp_bar and st['momentum_last_bar'] == exp_bar
+      and st['momentum']['pending_buys'] == {})
+n0 = len(ex.created); st = miter(ex)
+check("momentum: no new orders later in the same day", len(ex.created) == n0)
+# a new daily bar that is not a rebalance day -> ranks refresh, no trades
+st['momentum_last_bar'] = None; st['momentum']['last_rebalance'] = exp_bar - 3 * bot.DAY_MS; bot.save_state(st)
+rot = dict(base_series, SOL=wiggle(0.996, 0.01), ADA=wiggle(1.007, 0.01))
+ex.scenario.update(mscenario(rot, nowms)); n0 = len(ex.created)
+st = miter(ex)
+check("momentum: between rebalances nothing is traded", len(ex.created) == n0 and 'SOL/USD' in st['positions'])
+# rebalance day: SOL rotated out (post-only exit first; buys wait for the USD)
+st['momentum_last_bar'] = None; st['momentum']['last_rebalance'] = exp_bar - 7 * bot.DAY_MS; bot.save_state(st)
+ex.scenario['fill_frac'] = 0.0; n0 = len(ex.created)
+st = miter(ex)
+new = ex.created[n0:]
+check("momentum rotation: SOL flagged 'Rotated out', post-only sell at the ask, ADA queued",
+      st['positions']['SOL/USD']['exit_pending'] == 'Rotated out' and new and new[0][0] == 'SOL/USD'
+      and new[0][2] == 'sell' and new[0][5].get('postOnly') and 'ADA/USD' in st['momentum']['pending_buys'])
+check("momentum: no buys while an exit is still pending", not any(c[2] == 'buy' for c in new))
+for _ in range(bot.MOMENTUM_ORDER_MAX_ATTEMPTS):
+    st = miter(ex)
+check("momentum: exit falls back to a marketable limit after retries",
+      ex.created[-1][2] == 'sell' and not ex.created[-1][5].get('postOnly')
+      and ex.created[-1][4] < ex.scenario['prices']['SOL/USD'] * 0.9995)
+ex.scenario['fill_frac'] = 1.0
+st = miter(ex)
+check("momentum: after the exit fills, ADA is bought (ETH kept, not resized)",
+      'SOL/USD' not in st['positions'] and 'ADA/USD' in st['positions'] and 'ETH/USD' in st['positions']
+      and not any(c[0] == 'ETH/USD' for c in ex.created[n0:]))
+eq_, vals_, _ = bot._equity_and_values(ex, st, bot.get_balances(ex, st)[1])
+check("momentum: holdings stay within 80% of equity after buying (+ the buy fee)",
+      sum(vals_.values()) <= 0.8 * eq_ + 0.0025 * 800)
+# buy fallback after post-only retries, and the chase limit
+mreset(); ex = FakeMulti(mscenario(base_series, nowms, fill_frac=0.0))
+st = miter(ex)
+for _ in range(bot.MOMENTUM_ORDER_MAX_ATTEMPTS - 1):
+    st = miter(ex)
+check("momentum: unfilled post-only buys counted per coin",
+      all(q['attempts'] == bot.MOMENTUM_ORDER_MAX_ATTEMPTS for q in st['momentum']['pending_buys'].values()))
+n0 = len(ex.created); ex.scenario['fill_frac'] = 1.0
+st = miter(ex)
+fb = [c for c in ex.created[n0:] if c[2] == 'buy']
+check("momentum: buy falls back to a marketable limit (>= ask, <= chase cap)",
+      fb and all(not c[5].get('postOnly') and c[4] >= ex.scenario['prices'][c[0]] * 1.0005 - 1e-3 for c in fb)
+      and len(st['positions']) == 2)
+mreset(); ex = FakeMulti(mscenario(base_series, nowms, fill_frac=0.0)); st = miter(ex)
+ex.scenario['prices']['ETH/USD'] *= 1.10
+st = miter(ex)
+check("momentum: queued buy dropped when price ran >5% above the signal close",
+      'ETH/USD' not in st['momentum']['pending_buys'] and 'SOL/USD' in st['momentum']['pending_buys'])
+# regime off -> everything sold, queued buys cleared, USD held
+mreset(); ex = FakeMulti(mscenario(base_series, nowms)); st = miter(ex)
+bear = dict(base_series, BTC=wiggle(1.002, 0.01)[:200] + list(np.linspace(140, 90, 62)))
+ex.scenario.update(mscenario(bear, nowms)); st['momentum_last_bar'] = None; bot.save_state(st)
+st = miter(ex)
+check("momentum: BTC below 200d MA -> all holdings sold, no buys queued",
+      st['positions'] == {} and st['momentum']['pending_buys'] == {} and st['momentum']['snapshot']['regime_ok'] is False
+      and 'holding USD' in bot.bot_status['last_action'])
+check("momentum: regime-off exit doesn't reset the weekly schedule", st['momentum']['last_rebalance'] == exp_bar)
+# shared buy planner: drift band, top-ups only, exposure cap, $10 minimum
+mb = bot.momentum_buys
+check("momentum_buys: held coin inside the drift band -> no trade; far below -> top-up; no trimming",
+      mb({'A': 300.0}, ['A'], {'A': 0.4}, 1000, 0.5) == {}
+      and abs(mb({'A': 150.0}, ['A'], {'A': 0.4}, 1000, 0.5)['A'] - 250) < 1e-9
+      and mb({'A': 700.0}, ['A'], {'A': 0.4}, 1000, 0.5) == {}
+      and mb({'A': 700.0}, ['A'], {'A': 0.4}, 1000, 0.5, trim=True)['A'] == -300)
+check("momentum_buys: 80% cap counts existing holdings; orders under $10 dropped",
+      abs(mb({'A': 600.0}, ['A', 'B'], {'A': 0.4, 'B': 0.4}, 1000, None, max_invested=0.8)['B'] - 200) < 1e-9
+      and mb({'A': 795.0}, ['A', 'B'], {'A': 0.4, 'B': 0.4}, 1000, None, max_invested=0.8) == {}
+      and mb({}, ['A'], {'A': 0.005}, 1000) == {})
+# pending-order recovery (network error on a momentum buy)
+mreset(); ex = FakeMulti(mscenario(base_series, nowms, create_network_error=True))
+st = miter(ex)
+po = st['pending_order']
+check("momentum: unresolved buy kept as pending_order (portfolio/momentum), nothing recorded",
+      po and po['mode'] == 'portfolio' and po['strategy'] == 'momentum' and st['positions'] == {}
+      and bot.load_ledger() == [])
+ex.orders['Z1'] = {'id': 'Z1', 'symbol': po['symbol'], 'side': 'buy', 'amount': po['amount'], 'price': po['price'],
+                   'status': 'closed', 'filled': po['amount'], 'average': po['price'], 'cost': po['amount'] * po['price'],
+                   'fee': {'cost': 0.5, 'currency': 'USD'}, 'info': {'userref': po['userref']}}
+bot.resolve_pending_order(ex, st); st = bot.load_state()
+check("momentum: recovered fill opens a 'momentum' position", st['pending_order'] is None
+      and st['positions'][po['symbol']]['mode'] == 'momentum')
+# startup reconcile trims a position to what the exchange actually holds
+ex.bal[po['symbol'].split('/')[0]] = st['positions'][po['symbol']]['amount'] / 2
+bot.reconcile_on_startup(ex); st = bot.load_state()
+check("momentum: startup reconcile uses the exchange balance",
+      abs(st['positions'][po['symbol']]['amount'] - ex.bal[po['symbol'].split('/')[0]]) < 1e-12)
+# mode guard
+st['positions']['ADA/USD'] = {"amount": 1.0, "entry_price": 1.0, "entry_cost": 1.0, "entry_time": bot.utc_now().isoformat(),
+                              "highest_close": 1.0, "stop": 0.5, "exit_pending": None, "exit_attempts": 0}   # legacy = trend
+bot.save_state(st); n0 = len(ex.created)
+bot.trading_iteration(ex)
+check("mode guard: trend position blocks momentum trading", len(ex.created) == n0
+      and 'Blocked' in bot.bot_status['last_action'] and 'trend' in bot.bot_status['last_action'])
+del st['positions']['ADA/USD']; bot.save_state(st)
+bot.STRATEGY_MODE = 'trend'; bot.trading_iteration(ex)
+check("mode guard: momentum positions block trend trading", 'Blocked: momentum' in bot.bot_status['last_action'])
+bot.STRATEGY_MODE = 'rsi'; bot.trading_iteration(ex)
+check("mode guard: momentum positions block RSI trading", 'Blocked: momentum' in bot.bot_status['last_action'])
+bot.STRATEGY_MODE = 'momentum'
+# dashboard
+mreset(); ex = FakeMulti(mscenario(base_series, nowms)); st = miter(ex)
+r = client.get('/', headers=hdr)
+check("dashboard renders the momentum card (ranks, votes, weights, holdings)",
+      r.status_code == 200 and b'Top-2 Votes' in r.data and b'BTC regime' in r.data and b'(held)' in r.data)
+check("strategy description (momentum)", 'top 2 on at least 2 of the 30/60/90-day' in bot.strategy_description()
+      and '60%/yr' in bot.strategy_description())
+# DRY_RUN: paper wallet, nothing sent
+bot.DRY_RUN = True; mreset()
+ex = FakeMulti(mscenario(base_series, nowms))
+st = bot.default_state(); bot.save_state(st); st = miter(ex)
+check("momentum DRY_RUN: paper positions opened, no orders sent",
+      ex.created == [] and sorted(st['positions']) == ['ETH/USD', 'SOL/USD'] and st['paper']['USD'] < 1000
+      and st['paper']['USD'] > 1000 * 0.2 - 1)
+bot.DRY_RUN = False
+# the live settings map onto the backtester's parameters (research set + 80% cap + drift band)
+bp = bot.momentum_backtest_params()
+check("momentum_backtest_params: live config = backtested config",
+      bp['lookback_days'] == 'cons' and bp['top_k'] == 2 and bp['rebalance_days'] == 7 and bp['abs_filter']
+      and bp['regime'] and bp['vol_target'] == 0.6 and bp['exposure'] == 0.8 and bp['max_invested'] == 0.8
+      and bp['drift'] == 0.5 and bp['trim'] is False)
+for k_, v_ in msaved.items():
+    setattr(bot, k_, v_)
+mreset()
+
 # 12) shipped defaults are valid and the backtest runs with them
 for _k, _v in SHIPPED.items():
     setattr(bot, _k, _v)

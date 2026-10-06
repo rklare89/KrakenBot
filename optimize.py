@@ -744,9 +744,46 @@ def universes(args):
     return results
 
 
+def momentum_check(args):
+    """Backtest the live 'momentum' preset (app.momentum_backtest_params) next to the
+    research set it came from, on the same data/splits as `universes`."""
+    import importlib
+    import portfolio_backtest as pb
+    os.environ['STRATEGY_PRESET'] = 'momentum'
+    live_app = importlib.reload(app)
+    live = live_app.momentum_backtest_params()
+    research = dict(lookback_days='cons', top_k=2, rebalance_days=7, abs_filter=True, vol_target=0.6,
+                    breadth=0, regime=True)
+    cut = set_cutoff(load('coinbase', '4h', WATCH + EXTRA))
+    train_lo = int(pd.Timestamp('2023-01-01', tz='UTC').value // 10**6)
+    panel = _universe_panel('coinbase')
+    kp = _universe_panel('kraken')
+    coins = [s.split('/')[0] for s in live_app.WATCHLIST]
+    mask, kmask = pb.universe_mask(panel, coins=coins), pb.universe_mask(kp, coins=coins)
+    end = int(panel.ts[-1]) + 1
+    mid = cut + (end - cut) // 2
+    out = {}
+    for name, p in (('research set (universes study)', research), ('live preset config', live)):
+        print(f'\n=== {name}: {json.dumps(p)}')
+        rows = {'train': (panel, mask, train_lo, cut, {}), 'test': (panel, mask, cut, None, {}),
+                'test1': (panel, mask, cut, mid, {}), 'test2': (panel, mask, mid, None, {}),
+                'test taker+0.3%': (panel, mask, cut, None, dict(maker=pb.TAKER_FEE, slippage=0.003)),
+                'kraken test': (kp, kmask, cut, None, {})}
+        out[name] = {}
+        for part, (pn, mk, lo, hi, kw) in rows.items():
+            m = pb.momentum_sim(pn, p, lo, hi, universe=mk, **kw)
+            out[name][part] = m
+            print(f"   {part:16s} trades {m['trades']:4d} win {m['win_rate']:5.1f}% ret {m['return_pct']:8.2f}% "
+                  f"maxDD {m['max_dd']:6.2f}% fees {m['fees_pct']:5.2f}%")
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(out, f, indent=1, default=str)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['fetch', 'tune', 'compare', 'strategies', 'universes'])
+    ap.add_argument('cmd', choices=['fetch', 'tune', 'compare', 'strategies', 'universes', 'momentum_check'])
     ap.add_argument('--timeframe', default='4h')
     ap.add_argument('--extras', action='store_true', help='tune on watchlist + BTC/ETH/XRP/LINK/ADA')
     ap.add_argument('--procs', type=int, default=os.cpu_count() or 2)
@@ -768,6 +805,8 @@ def main():
         strategies(args)
     elif args.cmd == 'universes':
         universes(args)
+    elif args.cmd == 'momentum_check':
+        momentum_check(args)
     else:
         compare(args)
 

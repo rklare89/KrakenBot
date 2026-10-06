@@ -121,8 +121,8 @@ SCANNER_REFRESH_SEC = 3600
 # days, or intraday if price touches the ATR trailing stop (highest close since entry
 # minus TREND_ATR_MULT x ATR). Up to TREND_MAX_POSITIONS positions, each sized
 # POSITION_SIZE_PCT / TREND_MAX_POSITIONS of account equity (80%/10 = 8% each).
-STRATEGY_MODE = 'rsi'              # 'rsi' (single position, presets conservative/tuned_a)
-#                                    or 'trend' (multi-position portfolio)
+STRATEGY_MODE = 'rsi'              # 'rsi' (single position, presets conservative/tuned_a),
+#                                    'trend' or 'momentum' (multi-position portfolios)
 TREND_TIMEFRAME = '1d'
 TREND_ENTRY_DAYS = 55
 TREND_MA_DAYS = 200                # 0 = no moving-average filter
@@ -134,6 +134,31 @@ TREND_REGIME_FILTER = False        # True: only enter while BTC/USD close > its 
 TREND_MAX_ENTRY_CHASE_PCT = 0.03   # skip an entry if the bid ran >3% above the signal close
 TREND_EXIT_MAX_ATTEMPTS = 4        # post-only exit attempts before switching to a
 #                                    marketable (taker) limit
+
+# --- Momentum rotation ('momentum' mode; opt-in via STRATEGY_PRESET=momentum) ---------
+# Once per closed daily candle (UTC), rank the watchlist by 30/60/90-day return. A coin
+# qualifies when it is in the top MOMENTUM_TOP_K on at least 2 of the 3 lookbacks
+# ("consensus"), and (absolute filter) has a positive return on at least 2 of 3. Every
+# MOMENTUM_REBALANCE_DAYS hold the top MOMENTUM_TOP_K qualifiers, each sized
+# MOMENTUM_EXPOSURE / TOP_K of equity scaled by min(1, MOMENTUM_VOL_TARGET / 30-day
+# annualised volatility). Hold USD while BTC/USD closes below its 200-day MA (checked
+# daily; existing holdings are sold). Coins that drop out are sold at the next rebalance.
+MOMENTUM_LOOKBACKS = (30, 60, 90)  # days; 3 lookbacks = 2-of-3 consensus, 1 = plain ranking
+MOMENTUM_TOP_K = 2
+MOMENTUM_REBALANCE_DAYS = 7
+MOMENTUM_ABS_FILTER = True
+MOMENTUM_REGIME_FILTER = True      # hold USD unless BTC/USD close > its MA below
+MOMENTUM_REGIME_MA_DAYS = 200
+MOMENTUM_VOL_TARGET = 0.60         # annualised; None = equal weights
+MOMENTUM_VOL_DAYS = 30
+MOMENTUM_EXPOSURE = 0.80           # max fraction of equity invested (sum of all weights)
+MOMENTUM_MAX_WEIGHT = None         # optional per-coin cap (fraction of equity)
+MOMENTUM_REBALANCE_DRIFT = 0.5     # resize a coin that stays selected only if its value
+#                                    is more than 50% away from its target (None = never)
+MOMENTUM_MAX_INVESTED = 0.80      # buys never take holdings above 80% of equity (None = off)
+MOMENTUM_MAX_ENTRY_CHASE_PCT = 0.05  # drop a queued buy if the ask ran >5% above the signal close
+MOMENTUM_ORDER_MAX_ATTEMPTS = 4    # post-only attempts before a marketable-limit fallback
+MOMENTUM_DATA_GRACE_SEC = 7200     # wait up to 2h after the daily close for every coin's candle
 
 # --- Strategy presets ----------------------------------------------------------------
 # Tuning (optimize.py, Oct 2026; Coinbase 4h history Jan 2023 - Oct 2026, train = first
@@ -165,6 +190,18 @@ STRATEGY_PRESETS = {
                    'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
         TREND_ENTRY_DAYS=55, TREND_MA_DAYS=200, TREND_EXIT_DAYS=10, TREND_ATR_MULT=6,
         TREND_MAX_POSITIONS=10, TREND_REGIME_FILTER=False,
+    ),
+    # Momentum rotation (daily). Out-of-sample Jun 2025 - Oct 2026 on these 10 coins:
+    # +35.9% with 22.4% max drawdown (Kraken data +36.0% / 22.4%; +30.7% with taker fees
+    # and 0.3% slippage); train Jan 2023 - Jun 2025 +288% / 27.5% DD. Expect less live:
+    # the coin list itself was chosen with hindsight (see CHANGES.md). Opt-in only.
+    'momentum': dict(
+        STRATEGY_MODE='momentum',
+        WATCHLIST=['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD',
+                   'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
+        MOMENTUM_LOOKBACKS=(30, 60, 90), MOMENTUM_TOP_K=2, MOMENTUM_REBALANCE_DAYS=7,
+        MOMENTUM_ABS_FILTER=True, MOMENTUM_REGIME_FILTER=True, MOMENTUM_VOL_TARGET=0.60,
+        MOMENTUM_EXPOSURE=0.80,
     ),
 }
 STRATEGY_PRESET = os.getenv("STRATEGY_PRESET", "conservative").strip().lower()
@@ -352,6 +389,19 @@ def check_entry_signal(df):
 
 
 def strategy_description():
+    if STRATEGY_MODE == 'momentum':
+        lbs = '/'.join(str(d) for d in MOMENTUM_LOOKBACKS)
+        rule = (f"top {MOMENTUM_TOP_K} on at least 2 of the {lbs}-day returns" if len(MOMENTUM_LOOKBACKS) == 3
+                else f"top {MOMENTUM_TOP_K} by {lbs}-day return")
+        parts = [f"daily momentum rotation: hold the {rule}"]
+        if MOMENTUM_ABS_FILTER:
+            parts.append("only coins with positive momentum")
+        parts.append(f"rebalance every {MOMENTUM_REBALANCE_DAYS} days")
+        if MOMENTUM_REGIME_FILTER:
+            parts.append(f"USD while BTC < {MOMENTUM_REGIME_MA_DAYS}-day MA")
+        parts.append(f"up to {MOMENTUM_EXPOSURE * 100:.0f}% of equity"
+                     + (f", sized to {MOMENTUM_VOL_TARGET * 100:.0f}%/yr volatility" if MOMENTUM_VOL_TARGET else ""))
+        return ", ".join(parts)
     if STRATEGY_MODE == 'trend':
         parts = [f"daily close above prior {TREND_ENTRY_DAYS}-day high"
                  + (f" and above {TREND_MA_DAYS}-day MA" if TREND_MA_DAYS else "")]
@@ -455,6 +505,112 @@ def trend_stop_hit(price, stop):
     return stop is not None and price is not None and price <= stop
 
 
+# ----------------------------------------------------------------------------- momentum helpers
+# Shared by the live 'momentum' loop and portfolio_backtest.momentum_sim. Inputs are
+# pandas Series/DataFrames of CLOSED candles (rows = bars) or plain numpy rows.
+def momentum_returns(close, days, bpd=1):
+    """Return over the last `days` days: close / close `days` bars ago - 1."""
+    n = int(days * bpd)
+    return close / close.shift(n) - 1
+
+
+def momentum_volatility(close, days=30, bpd=1):
+    """Annualised standard deviation of log returns over `days` days."""
+    n = int(days * bpd)
+    return np.log(close).diff().rolling(n, min_periods=n).std() * np.sqrt(365 * bpd)
+
+
+def sma_regime(close, days=200, bpd=1):
+    """True where close > its `days`-day simple moving average (False while warming up)."""
+    n = int(days * bpd)
+    return close > close.rolling(n, min_periods=n).mean()
+
+
+def momentum_targets(rets_row, regime_ok, top_k, abs_filter):
+    """Indices of the top_k coins by return (NaN skipped); empty if the regime is off;
+    optional absolute-momentum filter (return > 0)."""
+    if not regime_ok:
+        return []
+    order = [j for j in np.argsort(-np.nan_to_num(rets_row, nan=-np.inf)) if np.isfinite(rets_row[j])]
+    if abs_filter:
+        order = [j for j in order if rets_row[j] > 0]
+    return order[:top_k]
+
+
+def momentum_select(rets_rows, regime_ok, top_k, abs_filter, mask=None):
+    """Ranking rule. rets_rows: list of 1 or 3 numpy return rows (one per lookback).
+    One lookback -> momentum_targets(). Three -> consensus: a coin qualifies if it is in
+    the top_k on at least 2 of the 3 lookbacks (ordered by mean rank); the absolute filter
+    then needs a positive return on at least 2 of 3. mask: coins allowed."""
+    if not regime_ok:
+        return []
+    rows = [np.where(mask, r, np.nan) if mask is not None else np.asarray(r, dtype=float) for r in rets_rows]
+    if len(rows) == 1:
+        return momentum_targets(rows[0], True, top_k, abs_filter)
+    votes, ranks = {}, {}
+    for r in rows:
+        order = [j for j in np.argsort(-np.nan_to_num(r, nan=-np.inf)) if np.isfinite(r[j])]
+        for pos, j in enumerate(order):
+            ranks.setdefault(j, []).append(pos)
+            if pos < top_k:
+                votes[j] = votes.get(j, 0) + 1
+    picks = [j for j, v in votes.items() if v >= 2 and len(ranks[j]) == len(rows)]
+    if abs_filter:
+        picks = [j for j in picks if sum(r[j] > 0 for r in rows) >= 2]
+    picks.sort(key=lambda j: np.mean(ranks[j]))
+    return picks[:top_k]
+
+
+def momentum_weight(top_k, vol=None, vol_target=None, max_weight=None, exposure=0.80):
+    """Fraction of equity for one holding: exposure/top_k, scaled by vol_target/vol when
+    volatility targeting is on (0 = don't buy if volatility is unknown), capped at
+    max_weight. With top_k holdings the total never exceeds `exposure`."""
+    w = exposure / top_k
+    if vol_target:
+        if vol is None or not np.isfinite(vol) or vol <= 0:
+            return 0.0
+        w *= min(1.0, vol_target / vol)
+    if max_weight:
+        w = min(w, max_weight)
+    return w
+
+
+def momentum_exits(held, targets):
+    """Holdings to sell completely: everything not in the new target list."""
+    return [k for k in held if k not in targets]
+
+
+def momentum_buys(held_values, targets, weights, equity, drift=None, min_trade=10.0,
+                  trim=False, max_invested=None):
+    """USD orders after the exits. held_values: {key: current USD value} of every holding
+    left after the exits; weights: {key: target fraction of equity}.
+    - New targets are bought at weight x equity (best-ranked first).
+    - A target that is already held is topped up only when it is more than `drift` x
+      target BELOW its target (None = never); with trim=True it is also cut back when more
+      than `drift` above (off by default: trimming winners cost ~90 points in train).
+    - max_invested: cap on (value of all holdings + new buys) as a fraction of equity.
+    - Orders below min_trade are dropped.
+    Returns {key: usd} (negative = sell that much)."""
+    orders = {}
+    room = (max_invested * equity - sum(held_values.values())) if max_invested is not None else float('inf')
+    for k in targets:
+        tgt = weights.get(k, 0.0) * equity
+        if k not in held_values:
+            usd = min(tgt, room)
+        elif drift is not None and tgt > 0 and abs(tgt - held_values[k]) > drift * tgt:
+            usd = tgt - held_values[k]
+            if usd > 0:
+                usd = min(usd, room)
+            elif not trim:
+                continue
+        else:
+            continue
+        if abs(usd) >= min_trade:
+            orders[k] = usd
+            room -= usd
+    return orders
+
+
 def fee_floor_price(entry_price):
     """Lowest exit price that is still profitable after round-trip fees + margin."""
     return entry_price * (1 + ROUND_TRIP_FEE + MIN_PROFIT_MARGIN)
@@ -533,6 +689,8 @@ def default_state():
     state["positions"] = {}           # 'trend' mode: symbol -> position dict
     state["trend_last_bar"] = None    # 'trend' mode: last daily bar evaluated (ms)
     state["trend_pending_entries"] = None
+    state["momentum_last_bar"] = None  # 'momentum' mode: last daily bar evaluated (ms)
+    state["momentum"] = {}            # 'momentum' mode: last_rebalance, targets, pending_buys, snapshot
     if DRY_RUN:
         state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
     return state
@@ -578,6 +736,8 @@ def load_state():
             state["cooldowns"] = {}
         if state.get("positions") is None:
             state["positions"] = {}
+        if state.get("momentum") is None:
+            state["momentum"] = {}
         if DRY_RUN and not state.get("paper"):
             state["paper"] = {"USD": DRY_RUN_USD_BALANCE}
         return state
@@ -944,8 +1104,9 @@ def _paper_apply(state, base, quote, base_delta, quote_delta):
         paper[quote] = paper.get(quote, 0.0) + quote_delta
 
 
-def apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=None, reason="Trend Breakout"):
-    """'trend' mode: open a position in state['positions'] from an actual fill."""
+def apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=None, reason="Trend Breakout", strategy=None):
+    """'trend' / 'momentum' modes: open (or top up) a position in state['positions'] from
+    an actual fill. The position is tagged with the strategy that opened it."""
     state["pending_order"] = None
     if fill is None or fill.filled <= 0:
         save_state(state)
@@ -958,14 +1119,23 @@ def apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=None, reason="Tr
         elif fill.fee_currency == quote:
             cost += fill.fee
     _paper_apply(state, base, quote, amount, -cost)
-    opened = is_sellable(exchange, symbol, amount, fill.average)
-    if opened:
-        state.setdefault("positions", {})[symbol] = {
+    positions = state.setdefault("positions", {})
+    existing = positions.get(symbol)
+    if existing:                                   # top-up of a held coin (momentum rebalance)
+        existing["amount"] += amount
+        existing["entry_cost"] += cost
+        existing["entry_price"] = existing["entry_cost"] / existing["amount"]
+        opened = True
+    else:
+        opened = is_sellable(exchange, symbol, amount, fill.average)
+    if opened and not existing:
+        positions[symbol] = {
             "amount": amount, "entry_price": fill.average, "entry_cost": cost,
             "entry_time": utc_now().isoformat(), "highest_close": fill.average,
-            "stop": trend_initial_stop(fill.average, atr), "exit_pending": None, "exit_attempts": 0,
+            "stop": trend_initial_stop(fill.average, atr) if (strategy or STRATEGY_MODE) == 'trend' else None,
+            "exit_pending": None, "exit_attempts": 0, "mode": strategy or STRATEGY_MODE,
         }
-    else:
+    elif not opened:
         logging.warning(f"Buy fill of {amount} {base} is below the market minimum (dust); not tracked.")
     save_state(state)
     save_trade("BUY", fill.average, fill.filled, fill.cost, symbol=symbol, fee=fill.fee,
@@ -1047,7 +1217,8 @@ def resolve_pending_order(exchange, state):
     if pending.get("mode") == 'portfolio':
         if pending["side"] == 'buy':
             apply_portfolio_buy_fill(exchange, state, symbol, fill, atr=pending.get("atr"),
-                                     reason=pending.get("reason", "Trend Breakout") + " (recovered)")
+                                     reason=pending.get("reason", "Trend Breakout") + " (recovered)",
+                                     strategy=pending.get("strategy", "trend"))
         else:
             apply_portfolio_sell_fill(exchange, state, symbol, fill,
                                       reason=pending.get("reason", "Exit") + " (recovered)")
@@ -1111,11 +1282,12 @@ def reconcile_on_startup(exchange):
         base, _ = market_base_quote(exchange, sym)
         held = float(total.get(base) or 0.0)
         if held < pos["amount"] * (1 - POSITION_TOLERANCE_PCT):
-            logging.warning(f"Discrepancy: trend position {sym} {pos['amount']} but exchange holds {held}.")
+            logging.warning(f"Discrepancy: {pos.get('mode', 'trend')} position {sym} {pos['amount']} "
+                            f"but exchange holds {held}.")
             if held > 0 and is_sellable(exchange, sym, held, pos["entry_price"]):
                 pos["amount"] = held
             else:
-                logging.error(f"No sellable {base} for trend position {sym}; removing it from state.")
+                logging.error(f"No sellable {base} for {pos.get('mode', 'trend')} position {sym}; removing it from state.")
                 state["positions"].pop(sym)
     symbol = state.get("symbol")
     if symbol:
@@ -1343,6 +1515,15 @@ def trend_scanner_rows():
 
 def update_scanner_cache():
     while True:
+        if STRATEGY_MODE == 'momentum':
+            try:
+                ex = get_public_exchange()
+                scanner_cache["momentum"] = momentum_snapshot(ex)
+                scanner_cache["last_updated"] = fmt_ts(utc_now())
+            except Exception as e:
+                logging.error(f"Error updating momentum scanner: {e}")
+            time.sleep(SCANNER_REFRESH_SEC)
+            continue
         if STRATEGY_MODE == 'trend':
             try:
                 scanner_cache["trend_rows"] = trend_scanner_rows()
@@ -1670,10 +1851,10 @@ def trend_iteration(exchange, state, free, total):
                 pend["symbols"].remove(sym)
                 continue
             fill = execute_order(exchange, state, sym, 'buy', amount, price, True, ORDER_TIMEOUT_SEC,
-                                 {"mode": "portfolio", "reason": "Trend Breakout", "atr": sig["atr"]})
+                                 {"mode": "portfolio", "strategy": "trend", "reason": "Trend Breakout", "atr": sig["atr"]})
             if fill is None:
                 break                                   # unresolved order: reconcile first
-            apply_portfolio_buy_fill(exchange, state, sym, fill, atr=sig["atr"])
+            apply_portfolio_buy_fill(exchange, state, sym, fill, atr=sig["atr"], strategy='trend')
             if fill.filled > 0:
                 pend["symbols"].remove(sym)
                 bot_status["last_action"] = f"Bought {fill.filled:g} {sym.split('/')[0]} at ${fill.average:,.4f} (Trend Breakout)"
@@ -1691,6 +1872,212 @@ def trend_iteration(exchange, state, free, total):
         bot_status["last_action"] = "No trend breakouts. Holding USD."
 
 
+# ----------------------------------------------------------------------------- momentum mode
+DAY_MS = 86_400_000
+
+
+def momentum_backtest_params():
+    """The live MOMENTUM_* settings as a portfolio_backtest.momentum_sim parameter dict
+    (used by optimize.py to check that the backtest matches the live configuration)."""
+    lbs = tuple(MOMENTUM_LOOKBACKS)
+    return dict(lookback_days='cons' if len(lbs) == 3 else lbs[0], top_k=MOMENTUM_TOP_K,
+                rebalance_days=MOMENTUM_REBALANCE_DAYS, abs_filter=MOMENTUM_ABS_FILTER,
+                regime=MOMENTUM_REGIME_FILTER, vol_target=MOMENTUM_VOL_TARGET, breadth=0,
+                exposure=MOMENTUM_EXPOSURE, max_weight=MOMENTUM_MAX_WEIGHT,
+                drift=MOMENTUM_REBALANCE_DRIFT, trim=False, max_invested=MOMENTUM_MAX_INVESTED)
+
+
+def fetch_daily_df(exchange, symbol):
+    need = max(MOMENTUM_REGIME_MA_DAYS, max(MOMENTUM_LOOKBACKS), MOMENTUM_VOL_DAYS) + 40
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=min(720, need))
+    return ohlcv_to_closed_df(ohlcv, '1d', exchange.milliseconds())
+
+
+def momentum_snapshot(exchange, expected_bar=None):
+    """Rank the watchlist on the last closed daily candle with the shared helpers.
+    Coins whose latest candle isn't the expected bar are treated as missing (NaN).
+    regime_ok is None when the BTC candle needed for the regime filter is not available."""
+    syms = list(WATCHLIST)
+    dfs = {}
+    for sym in dict.fromkeys(syms + (['BTC/USD'] if MOMENTUM_REGIME_FILTER else [])):
+        try:
+            df = fetch_daily_df(exchange, sym)
+        except ccxt.BaseError as e:
+            logging.warning(f"Momentum: no daily candles for {sym}: {e}")
+            continue
+        if len(df) and (expected_bar is None or int(df['timestamp'].iloc[-1]) == expected_bar):
+            dfs[sym] = df
+    rets = np.full((len(MOMENTUM_LOOKBACKS), len(syms)), np.nan)
+    vols, closes = np.full(len(syms), np.nan), np.full(len(syms), np.nan)
+    for j, sym in enumerate(syms):
+        if sym in dfs:
+            c = dfs[sym]['close'].astype(float)
+            for i, d in enumerate(MOMENTUM_LOOKBACKS):
+                rets[i, j] = float(momentum_returns(c, d).iloc[-1])
+            vols[j] = float(momentum_volatility(c, MOMENTUM_VOL_DAYS).iloc[-1])
+            closes[j] = float(c.iloc[-1])
+    regime_ok, btc_close, btc_ma = True, None, None
+    if MOMENTUM_REGIME_FILTER:
+        b = dfs.get('BTC/USD')
+        if b is None:
+            regime_ok = None
+        else:
+            bc = b['close'].astype(float)
+            n = MOMENTUM_REGIME_MA_DAYS
+            btc_close, btc_ma = float(bc.iloc[-1]), float(bc.rolling(n, min_periods=n).mean().iloc[-1])
+            regime_ok = bool(sma_regime(bc, n).iloc[-1])
+    picks = momentum_select(list(rets), bool(regime_ok), MOMENTUM_TOP_K, MOMENTUM_ABS_FILTER)
+    ranked = momentum_select(list(rets), True, len(syms), False)       # display order only
+    weights = {syms[j]: float(momentum_weight(MOMENTUM_TOP_K, vols[j], MOMENTUM_VOL_TARGET, MOMENTUM_MAX_WEIGHT,
+                                              MOMENTUM_EXPOSURE)) for j in picks}
+    rows = []
+    for j, sym in enumerate(syms):
+        top = sum(1 for i in range(len(MOMENTUM_LOOKBACKS)) if np.isfinite(rets[i, j]) and
+                  int((rets[i] > rets[i, j]).sum()) < MOMENTUM_TOP_K)
+        rows.append({"symbol": sym, "close": None if np.isnan(closes[j]) else closes[j],
+                     "rets": [None if np.isnan(x) else round(100 * x, 2) for x in rets[:, j]],
+                     "vol": None if np.isnan(vols[j]) else round(100 * vols[j], 1), "votes": top,
+                     "rank": ranked.index(j) + 1 if j in ranked else None,
+                     "selected": j in picks, "weight": round(100 * weights.get(sym, 0.0), 1)})
+    rows.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0))
+    return {"bar": int(expected_bar) if expected_bar is not None else None, "rows": rows,
+            "targets": [syms[j] for j in picks], "weights": weights, "regime_ok": regime_ok,
+            "btc_close": btc_close, "btc_ma": btc_ma, "missing": [s for s in syms if s not in dfs]}
+
+
+def _equity_and_values(exchange, state, total, prices=None):
+    prices = dict(prices or {})
+    values = {}
+    for sym, pos in (state.get("positions") or {}).items():
+        if sym not in prices:
+            t = exchange.fetch_ticker(sym)
+            prices[sym] = t.get('last') or t.get('bid')
+        values[sym] = pos["amount"] * (prices[sym] or pos["entry_price"])
+    return float(total.get('USD') or 0.0) + sum(values.values()), values, prices
+
+
+def momentum_iteration(exchange, state, free, total):
+    """One loop of the momentum rotation.
+
+    Every loop: retry pending exits (post-only, marketable limit after
+    MOMENTUM_ORDER_MAX_ATTEMPTS) and, once no exit is pending, queued buys (same retry
+    rule). Once per newly closed daily candle: recompute ranks; on a rebalance day (every
+    MOMENTUM_REBALANCE_DAYS) or when the BTC regime turns off, flag exits for coins that
+    are no longer targets and queue buys for new targets.
+    """
+    positions = state.setdefault("positions", {})
+    mom = state.setdefault("momentum", {})
+    expected_bar = (exchange.milliseconds() // DAY_MS) * DAY_MS - DAY_MS
+
+    # 1) pending exits
+    for sym in [s for s, p in positions.items() if p.get("exit_pending")]:
+        pos = positions[sym]
+        urgent = int(pos.get("exit_attempts") or 0) >= MOMENTUM_ORDER_MAX_ATTEMPTS
+        trend_exit(exchange, state, sym, urgent, pos["exit_pending"], free)
+        free, total = get_balances(exchange, state)
+
+    # 2) once per new daily close
+    if state.get("momentum_last_bar") != expected_bar:
+        snap = momentum_snapshot(exchange, expected_bar)
+        waited = (exchange.milliseconds() - (expected_bar + DAY_MS)) / 1000
+        if snap["regime_ok"] is None:
+            logging.info("Momentum: BTC daily candle not available yet; will retry next loop.")
+        elif snap["missing"] and waited < MOMENTUM_DATA_GRACE_SEC:
+            logging.info(f"Momentum: waiting for daily candles of {snap['missing']}; will retry next loop.")
+        else:
+            last = mom.get("last_rebalance")
+            due = last is None or expected_bar - int(last) >= MOMENTUM_REBALANCE_DAYS * DAY_MS
+            regime_off = MOMENTUM_REGIME_FILTER and not snap["regime_ok"]
+            if due or (regime_off and (positions or mom.get("pending_buys"))):
+                targets = snap["targets"]
+                why = f"BTC below {MOMENTUM_REGIME_MA_DAYS}-day MA" if regime_off else "Rotated out"
+                for sym in momentum_exits(list(positions), targets):
+                    if not positions[sym].get("exit_pending"):
+                        positions[sym]["exit_pending"] = why
+                        positions[sym]["exit_attempts"] = 0
+                mom["pending_buys"] = {s: {"weight": snap["weights"][s],
+                                           "close": next(r["close"] for r in snap["rows"] if r["symbol"] == s),
+                                           "attempts": 0} for s in targets}
+                mom["targets"] = targets
+                if due:
+                    mom["last_rebalance"] = expected_bar
+                logging.info(f"Momentum rebalance ({'scheduled' if due else 'regime off'}) bar {expected_bar}: "
+                             f"targets {targets}, weights { {k: round(v, 3) for k, v in snap['weights'].items()} }, "
+                             f"exits {[s for s, p in positions.items() if p.get('exit_pending')]}")
+            if snap["missing"]:
+                logging.warning(f"Momentum: no fresh daily candle for {snap['missing']} (excluded this bar).")
+            mom["snapshot"] = snap
+            state["momentum_last_bar"] = expected_bar
+            save_state(state)
+            for sym in [s for s, p in positions.items() if p.get("exit_pending")]:
+                trend_exit(exchange, state, sym, False, positions[sym]["exit_pending"], free)
+                free, total = get_balances(exchange, state)
+
+    # 3) queued buys, only after every exit has gone through (they need the USD)
+    pend = mom.get("pending_buys") or {}
+    if pend and not any(p.get("exit_pending") for p in positions.values()):
+        blocked = set() if DRY_RUN else {o.get('symbol') for o in exchange.fetch_open_orders()}
+        for sym in list(pend):
+            if sym in blocked:
+                continue
+            free, total = get_balances(exchange, state)
+            equity, values, _ = _equity_and_values(exchange, state, total)
+            order_usd = momentum_buys(values, list(pend), {s: q["weight"] for s, q in pend.items()}, equity,
+                                      MOMENTUM_REBALANCE_DRIFT, MIN_TRADE_USD, trim=False,
+                                      max_invested=MOMENTUM_MAX_INVESTED).get(sym)
+            if not order_usd or order_usd <= 0:
+                pend.pop(sym)                    # already held within the drift band, or too small
+                continue
+            q = pend[sym]
+            ticker = exchange.fetch_ticker(sym)
+            bid = ticker.get('bid') or ticker.get('last')
+            ask = ticker.get('ask') or ticker.get('last')
+            cap = q["close"] * (1 + MOMENTUM_MAX_ENTRY_CHASE_PCT)
+            if bid > cap:
+                logging.info(f"Momentum: skipping {sym}; bid {bid} ran more than "
+                             f"{MOMENTUM_MAX_ENTRY_CHASE_PCT:.0%} above the signal close {q['close']}")
+                pend.pop(sym)
+                continue
+            post_only = int(q.get("attempts") or 0) < MOMENTUM_ORDER_MAX_ATTEMPTS
+            raw = bid if post_only else min(ask * (1 + STOP_LOSS_MAX_SLIPPAGE_PCT), cap)
+            price = round_price(exchange, sym, raw, 'buy' if post_only else 'sell')
+            usd = min(order_usd, float(free.get('USD') or 0.0) * 0.99)
+            amount = round_amount(exchange, sym, usd / price) if price else 0.0
+            ok, msg = check_order_limits(exchange, sym, amount, price)
+            if not ok or amount * price < MIN_TRADE_USD:
+                logging.info(f"Momentum: skipping buy of {sym}: {msg or 'below MIN_TRADE_USD'}")
+                pend.pop(sym)
+                continue
+            fill = execute_order(exchange, state, sym, 'buy', amount, price, post_only,
+                                 ORDER_TIMEOUT_SEC if post_only else STOP_LOSS_ORDER_TIMEOUT_SEC,
+                                 {"mode": "portfolio", "strategy": "momentum", "reason": "Momentum Rotation"})
+            if fill is None:
+                break                                    # unresolved order: reconcile first
+            apply_portfolio_buy_fill(exchange, state, sym, fill, reason="Momentum Rotation", strategy='momentum')
+            if fill.filled > 0:
+                pend.pop(sym, None)
+                bot_status["last_action"] = (f"Bought {fill.filled:g} {sym.split('/')[0]} at "
+                                             f"${fill.average:,.4f} (Momentum Rotation)")
+            else:
+                q["attempts"] = int(q.get("attempts") or 0) + 1
+        mom["pending_buys"] = pend
+        save_state(state)
+
+    # dashboard
+    snap = mom.get("snapshot") or {}
+    held = sorted(positions)
+    nxt = (int(mom["last_rebalance"]) + (MOMENTUM_REBALANCE_DAYS + 1) * DAY_MS) if mom.get("last_rebalance") else None
+    bot_status["active_symbol"] = ", ".join(s.split('/')[0] for s in held) if held else "None (USD)"
+    bot_status["asset_balance"] = float(len(held))
+    bot_status["positions"] = [dict(symbol=s, amount=p["amount"], entry=p["entry_price"], stop=None,
+                                    exit_pending=p.get("exit_pending")) for s, p in sorted(positions.items())]
+    bot_status["momentum"] = dict(snap, held=held, pending_buys=sorted(pend),
+                                  next_rebalance=fmt_ts(datetime.fromtimestamp(nxt / 1000, timezone.utc)) if nxt else "next daily close")
+    if not held and not pend:
+        bot_status["last_action"] = ("BTC below its 200-day MA: holding USD." if snap.get("regime_ok") is False
+                                     else "No momentum targets: holding USD.")
+
+
 def trading_iteration(exchange):
     state = load_state()
     free, total = get_balances(exchange, state)
@@ -1704,17 +2091,30 @@ def trading_iteration(exchange):
         free, total = get_balances(exchange, state)
         usd_free = float(free.get('USD') or 0.0)
 
-    if STRATEGY_MODE == 'trend':
+    positions = state.get("positions") or {}
+    foreign = sorted(s for s, p in positions.items() if p.get("mode", "trend") != STRATEGY_MODE)
+    if STRATEGY_MODE in ('trend', 'momentum'):
         if state.get("symbol"):
             logging.error(f"State holds an RSI-mode position in {state['symbol']} but the preset is "
-                          f"'trend'. Not trading until it is closed or the preset is switched back.")
-            bot_status["last_action"] = "Blocked: RSI-mode position open while preset is 'trend'."
+                          f"'{STRATEGY_MODE}'. Not trading until it is closed or the preset is switched back.")
+            bot_status["last_action"] = f"Blocked: RSI-mode position open while preset is '{STRATEGY_MODE}'."
             return
-        trend_iteration(exchange, state, free, total)
-    elif state.get("positions"):
-        logging.error(f"State holds trend-mode positions {sorted(state['positions'])} but the preset is "
+        if foreign:
+            modes = sorted({positions[s].get("mode", "trend") for s in foreign})
+            logging.error(f"State holds {'/'.join(modes)}-mode positions {foreign} but the preset is "
+                          f"'{STRATEGY_MODE}'. Not trading until they are closed or the preset is switched back.")
+            bot_status["last_action"] = (f"Blocked: {'/'.join(modes)} positions open while preset is "
+                                         f"'{STRATEGY_MODE}'.")
+            return
+        if STRATEGY_MODE == 'trend':
+            trend_iteration(exchange, state, free, total)
+        else:
+            momentum_iteration(exchange, state, free, total)
+    elif positions:
+        modes = sorted({p.get("mode", "trend") for p in positions.values()})
+        logging.error(f"State holds {'/'.join(modes)}-mode positions {sorted(positions)} but the preset is "
                       f"'{STRATEGY_PRESET}'. Not trading until they are closed or the preset is switched back.")
-        bot_status["last_action"] = "Blocked: trend positions open while preset is not 'trend'."
+        bot_status["last_action"] = f"Blocked: {'/'.join(modes)} positions open while preset is not '{modes[0]}'."
         return
     elif state.get("symbol"):
         manage_position(exchange, state, free, total)
@@ -1808,7 +2208,25 @@ HTML_TEMPLATE = """
     <div class="card">
         <h2>Multi-Asset Rotation Scanner</h2>
         <p style="font-size: 13px; color: #aaa;">Simulates ~{{ scanner.days }}-day performance of the live strategy ({{ timeframe }} candles: {{ strategy }}), including Kraken fees. (Updated: {{ scanner.last_updated }})</p>
-        {% if mode == 'trend' %}
+        {% if mode == 'momentum' %}
+        {% set m = status.momentum or scanner.momentum or {} %}
+        <p>BTC regime: {% if m.regime_ok %}<span style="color:#28a745;">ON</span> (BTC {{ "%.0f"|format(m.btc_close or 0) }} &gt; 200d MA {{ "%.0f"|format(m.btc_ma or 0) }}){% elif m.regime_ok is sameas false %}<span style="color:#dc3545;">OFF - holding USD</span> (BTC {{ "%.0f"|format(m.btc_close or 0) }} &lt; 200d MA {{ "%.0f"|format(m.btc_ma or 0) }}){% else %}unknown{% endif %}
+           | Targets: {{ (m.targets or [])|join(', ') or 'none' }} | Holdings: {{ (m.held or [])|join(', ') or 'none' }}
+           | Next rebalance: {{ m.next_rebalance or 'after the next daily close' }}{% if m.pending_buys %} | Queued buys: {{ m.pending_buys|join(', ') }}{% endif %}</p>
+        <table>
+            <tr><th>Rank</th><th>Asset</th>{% for d in lookbacks %}<th>{{ d }}d Return</th>{% endfor %}<th>Top-{{ top_k }} Votes</th><th>30d Vol (ann.)</th><th>Target Weight</th></tr>
+            {% for r in m.rows or [] %}
+            <tr>
+                <td>{{ r.rank or '-' }}</td>
+                <td style="font-weight:bold; color: {{ '#28a745' if r.selected else '#00adb5' }};">{{ r.symbol.split('/')[0] }}{% if r.symbol in (m.held or []) %} (held){% endif %}</td>
+                {% for x in r.rets %}<td style="color: {{ '#28a745' if (x or 0) > 0 else '#dc3545' }};">{{ '%.1f%%'|format(x) if x is not none else '-' }}</td>{% endfor %}
+                <td>{{ r.votes }}/{{ lookbacks|length }}</td>
+                <td>{{ '%.0f%%'|format(r.vol) if r.vol is not none else '-' }}</td>
+                <td style="font-weight:bold;">{{ '%.1f%%'|format(r.weight) if r.selected else '-' }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% elif mode == 'trend' %}
         <table>
             <tr><th>Asset</th><th>Last Daily Close</th><th>Prior High (entry level)</th><th>Long MA</th><th>Breakout Signal</th></tr>
             {% for r in scanner.trend_rows or [] %}
@@ -1889,9 +2307,11 @@ def dashboard():
             status=bot_status,
             trades=pnl_data[-10:],
             scanner=scanner_cache,
-            timeframe=TIMEFRAME,
+            timeframe='1d' if STRATEGY_MODE in ('trend', 'momentum') else TIMEFRAME,
             strategy=strategy_description(),
             mode=STRATEGY_MODE,
+            lookbacks=list(MOMENTUM_LOOKBACKS),
+            top_k=MOMENTUM_TOP_K,
             dry_run=DRY_RUN
         )
     except Exception as e:
