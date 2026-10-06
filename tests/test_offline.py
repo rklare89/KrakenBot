@@ -390,6 +390,48 @@ mm = pb.momentum_sim(panel, mp)
 check("momentum: rotates into the rising coin and profits", mm['trades'] >= 1 and mm['return_pct'] > 0)
 bh = pb.buy_hold(panel, [2])
 check("buy-and-hold benchmark loses on the falling coin", bh['return_pct'] < -45)
+# universe construction (no look-ahead) and momentum drawdown reducers
+def daily_v(closes, vols, t0=1_672_531_200_000):
+    d = daily(closes, t0); d["volume"] = np.asarray(vols, float); return d
+n_ = 200
+uv = {"A": daily_v([10.0] * n_, [100.0] * n_),                                   # liquid all along
+      "B": daily_v([10.0] * n_, [1.0] * 100 + [1000.0] * 100),                    # becomes liquid at day 100
+      "C": daily_v([10.0] * 50, [5000.0] * 50, t0=1_672_531_200_000 + 150 * day)}  # listed late, very liquid
+upanel = pb.Panel(uv, uv["A"], 1)
+um = pb.universe_mask(upanel, top_n=1, min_days=90)
+iA, iB, iC = upanel.coins.index("A"), upanel.coins.index("B"), upanel.coins.index("C")
+check("universe: top-1 by trailing volume switches only after B's volume shows up",
+      um[99, iA] and not um[99, iB] and um[140, iB] and not um[140, iA])
+check("universe: newly listed coin excluded until 90 days of history", not um[:, iC].any())
+uv2 = dict(uv); uv2["B"] = daily_v([10.0] * n_, [1.0] * 100 + [1.0] * 100)
+um2 = pb.universe_mask(pb.Panel(uv2, uv2["A"], 1), top_n=1, min_days=90)
+check("universe: rows before a change don't depend on future volume", (um2[:100] == um[:100]).all())
+fz = pb.universe_mask(upanel, top_n=1, min_days=90, freeze_at_ms=int(upanel.ts[96]))
+check("universe: frozen list = list known at the period start", fz[180, iA] and not fz[180, iB])
+check("universe: exclude and per-sector cap",
+      not pb.universe_mask(upanel, top_n=2, exclude={"A"})[150, iA]
+      and pb.universe_mask(upanel, top_n=2, sectors={"A": "x", "B": "x"}, per_sector=1)[150].sum() == 1)
+r30, r60, r90 = np.array([0.5, 0.4, 0.1, -0.1]), np.array([0.1, 0.5, 0.4, -0.1]), np.array([0.6, 0.1, 0.5, 0.2])
+check("momentum_select: consensus = top-k on 2 of 3 lookbacks",
+      pb.momentum_select([r30, r60, r90], True, 2, False) == [0, 1]
+      and pb.momentum_select([r30, r60, -np.abs(r90)], True, 2, True) == [1]
+      and pb.momentum_select([-np.abs(r30), -np.abs(r60), r90], True, 2, True) == [])
+check("momentum_select: universe mask and regime respected",
+      pb.momentum_select([r30], True, 1, False, mask=np.array([False, True, True, True])) == [1]
+      and pb.momentum_select([r30], False, 1, False) == [])
+check("momentum_weight: vol targeting scales down, cap applies",
+      abs(pb.momentum_weight(2, vol=1.2, vol_target=0.6) - 0.2) < 1e-12
+      and pb.momentum_weight(2, vol=0.3, vol_target=0.6) == 0.4
+      and pb.momentum_weight(1, max_weight=0.25) == 0.25
+      and pb.momentum_weight(2, vol=np.nan, vol_target=0.6) == 0.0)
+noisy = list(100 * np.cumprod(1 + 0.004 + 0.08 * np.where(np.arange(160) % 2, 1, -1)))
+vp = pb.Panel({"N": daily(noisy), "FLAT": daily([50.0] * 160)}, daily(noisy), 1)
+full = pb.momentum_sim(vp, dict(mp, lookback_days=40))
+scaled = pb.momentum_sim(vp, dict(mp, lookback_days=40, vol_target=0.6))
+check("momentum: vol targeting shrinks exposure to a very volatile coin",
+      scaled['trades'] >= 1 and abs(scaled['return_pct']) < abs(full['return_pct']))
+check("momentum: breadth filter keeps cash when the universe is weak",
+      pb.momentum_sim(panel, dict(mp, breadth=0.99))['trades'] == 0)
 
 
 # 14) live 'trend' mode (multi-position) against the fake exchange

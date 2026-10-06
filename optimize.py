@@ -547,9 +547,206 @@ def strategies(args):
     return results
 
 
+
+# ============================================================================ momentum universes
+# Sector labels (descriptive, not return-based) for coins that reach the top-30 by liquidity.
+SECTORS = {
+    'payments': 'BTC LTC BCH XLM XRP DASH ZEC ETC XCN',
+    'l1': 'ETH SOL ADA AVAX DOT NEAR SUI ICP ALGO ATOM APT SEI TIA HBAR INJ HYPE MON TON BERA VET MINA FLOW BNB XTZ EGLD KAS',
+    'l2': 'OP ARB STX IMX STRK POL MATIC ZRO',
+    'defi': 'LINK UNI AAVE CRV LDO ONDO AERO SUSHI YFI COMP SNX LQTY JTO ENA SYRUP ORCA UMA PERP DRIFT LIGHTER AVNT ZRX API3 PYTH RAY JUP MORPHO WLFI MKR SKY',
+    'ai': 'FET TAO RENDER GRT VVV OCEAN AIOZ PROMPT ARPA NMR AIXBT VIRTUAL COOKIE CLANKER ALLO',
+    'meme': 'DOGE SHIB BONK PEPE WIF FARTCOIN PENGU TRUMP MOODENG TOSHI POPCAT PNUT USELESS DEGEN TURBO SPX MEW FLOKI BRETT GIGA PUMP',
+    'gaming': 'APE MANA SAND AXS SUPER BIGTIME PRIME GST CHZ ILV',
+}
+SECTOR_OF = {c: s for s, cs in SECTORS.items() for c in cs.split()}
+MEMES = set(SECTORS['meme'].split())
+UNIV_DIR = os.path.join(DATA_DIR, 'universe')
+
+
+def _universe_panel(source):
+    """Daily panel of the whole pool. coinbase: since 2022 (warm-up for 200d MA / 90d
+    listing rule); kraken: last 720 days. Today's forming candle is dropped."""
+    import glob
+    import portfolio_backtest as pb
+    pre = 'cb' if source == 'coinbase' else 'kr'
+    today = pd.Timestamp.now(tz='UTC').normalize().value // 10**6
+    dfs = {}
+    for f in sorted(glob.glob(f'{UNIV_DIR}/{pre}_*_1d.csv')):
+        d = pd.read_csv(f)
+        d = d[d['timestamp'] < today].reset_index(drop=True)
+        if len(d) >= 30:
+            dfs[os.path.basename(f)[3:-7]] = d
+    return pb.Panel(dfs, dfs['BTC'], 1)
+
+
+def universe_specs(pool_today):
+    """name -> kwargs for portfolio_backtest.universe_mask (+ 'freeze': per-period list)."""
+    cur10 = WATCH + EXTRA
+    return {
+        'orig5': dict(coins=WATCH),
+        'cur10': dict(coins=cur10),
+        'dyn10': dict(top_n=10),
+        'dyn15': dict(top_n=15),
+        'dyn20': dict(top_n=20),
+        'dyn30': dict(top_n=30),
+        'dyn20_nomeme': dict(top_n=20, exclude=MEMES),
+        'dyn30_nomeme': dict(top_n=30, exclude=MEMES),
+        'start15': dict(top_n=15, freeze=True),
+        'start30': dict(top_n=30, freeze=True),
+        'sector20': dict(top_n=20, sectors=SECTOR_OF, per_sector=3),
+        'l1_payments10': dict(top_n=10, coins=SECTORS['l1'].split() + SECTORS['payments'].split()),
+        'defi10': dict(top_n=10, coins=SECTORS['defi'].split()),
+        'today20 (biased)': dict(coins=pool_today[:20]),
+    }
+
+
+def sensitivity_specs(pool_today):
+    """Post-hoc robustness variants of the liquidity rule (chosen after seeing the main
+    results, so they are sensitivity checks, not candidates)."""
+    return {
+        'cur10': dict(coins=WATCH + EXTRA),
+        'dyn10 vol90d': dict(top_n=10, vol_days=90),
+        'dyn15 vol90d': dict(top_n=15, vol_days=90),
+        'dyn20 vol90d': dict(top_n=20, vol_days=90),
+        'dyn10 listed365d': dict(top_n=10, min_days=365),
+        'dyn15 listed365d': dict(top_n=15, min_days=365),
+        'dyn15 nomeme vol90d': dict(top_n=15, vol_days=90, exclude=MEMES),
+    }
+
+
+def _masks(panel, spec, starts):
+    import portfolio_backtest as pb
+    kw = {k: v for k, v in spec.items() if k != 'freeze'}
+    if spec.get('freeze'):
+        return {s: pb.universe_mask(panel, freeze_at_ms=s, **kw) for s in starts}
+    m = pb.universe_mask(panel, **kw)
+    return {s: m for s in starts}
+
+
+MOMU_AXES = {'lookback_days': [30, 60, 90, 'cons'], 'top_k': [1, 2, 3], 'rebalance_days': [3, 7],
+             'abs_filter': [False, True], 'vol_target': [None, 0.6], 'breadth': [0, 0.5]}
+
+
+def _momu_neighbours(p):
+    out = []
+    for k_, vals in MOMU_AXES.items():
+        if k_ == 'lookback_days' and p[k_] == 'cons':
+            continue
+        vv = [v for v in vals if v != 'cons']
+        i = vv.index(p[k_])
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(vv):
+                out.append(key({**p, k_: vv[j]}))
+    return out
+
+
+def _momu_run(args_):
+    import portfolio_backtest as pb
+    uname, p, lo, hi, kw = args_
+    masks = _G['masks'][uname]
+    return uname, p, pb.momentum_sim(_G['panel'], p, lo, hi, universe=masks[lo], **kw)
+
+
+def universes(args):
+    """Momentum rotation across candidate universes (python optimize.py universes)."""
+    import portfolio_backtest as pb
+    cut = set_cutoff(load('coinbase', '4h', WATCH + EXTRA))
+    train_lo = int(pd.Timestamp('2023-01-01', tz='UTC').value // 10**6)
+    with open(f'{UNIV_DIR}/pool.json') as f:
+        pool_today = [r['coin'] for r in json.load(f)]
+    panel = _universe_panel('coinbase')
+    end = int(panel.ts[-1]) + 1
+    mid = cut + (end - cut) // 2
+    starts = [train_lo, cut, mid]
+    specs = (sensitivity_specs if getattr(args, 'sensitivity', False) else universe_specs)(pool_today)
+    masks = {u: _masks(panel, s, starts) for u, s in specs.items()}
+    print(f'pool {len(panel.coins)} coins | train {pd.Timestamp(train_lo, unit="ms").date()} .. '
+          f'{pd.Timestamp(cut, unit="ms").date()} | test .. {pd.Timestamp(end, unit="ms").date()}')
+    for u in [x for x in ('dyn15', 'dyn30', 'start30', 'sector20', 'dyn15 vol90d') if x in masks]:
+        for s in (train_lo, cut):
+            i = int(np.searchsorted(panel.ts, s)) - 1
+            print(f'  {u:9s} at {pd.Timestamp(s, unit="ms").date()}: '
+                  + ' '.join(np.array(panel.coins)[masks[u][s][i]]))
+    sets = [dict(zip(MOMU_AXES, v), regime=True) for v in itertools.product(*MOMU_AXES.values())]
+    _G['panel'], _G['masks'] = panel, masks
+    results = {'cut': cut, 'universes': {}}
+    with Pool(args.procs, initializer=lambda: None) as pool:
+        jobs = [(u, p, train_lo, cut, {}) for u in specs for p in sets]
+        train = {}
+        for u, p, m in pool.imap_unordered(_momu_run, jobs, chunksize=8):
+            train[(u, key(p))] = (p, m)
+        for u in specs:
+            sc = {k_: _strat_score(m) for (uu, k_), (p, m) in train.items() if uu == u}
+            def robust(k_):
+                ks = [k_] + _momu_neighbours(train[(u, k_)][0])
+                return float(np.mean([max(sc[x], -5) for x in ks if x in sc]))
+            ranked = sorted(sc, key=robust, reverse=True)
+            top = [train[(u, k_)][0] for k_ in ranked[:20]]
+            tj = [(u, p, cut, None, {}) for p in top]
+            top_test = [m for _, _, m in pool.map(_momu_run, tj)]
+            best = top[0]
+            ev = {'train': train[(u, ranked[0])][1]}
+            for name, (lo, hi, kw) in {'test': (cut, None, {}), 'test1': (cut, mid, {}), 'test2': (mid, None, {}),
+                                       'test taker+0.1%': (cut, None, dict(maker=pb.TAKER_FEE, slippage=0.001)),
+                                       'test taker+0.3%': (cut, None, dict(maker=pb.TAKER_FEE, slippage=0.003))}.items():
+                ev[name] = _momu_run((u, best, lo, hi, kw))[2]
+            results['universes'][u] = {'best': best, 'robust': robust(ranked[0]), 'eval': ev,
+                                       'top20_test': top_test,
+                                       'top20_median_ret': float(np.median([m['return_pct'] for m in top_test])),
+                                       'top20_median_dd': float(np.median([m['max_dd'] for m in top_test])),
+                                       'top20_positive': int(sum(m['return_pct'] > 0 for m in top_test))}
+            print(f"\n=== {u}: chosen {json.dumps(best)} robust {robust(ranked[0]):.2f}")
+            for part, m in ev.items():
+                print(f"   {part:16s} trades {m['trades']:4d} win {m['win_rate']:5.1f}% ret {m['return_pct']:8.2f}% "
+                      f"maxDD {m['max_dd']:6.2f}% fees {m['fees_pct']:5.2f}%")
+            r_ = results['universes'][u]
+            print(f"   top-20 train sets on test: {r_['top20_positive']}/20 positive, median ret "
+                  f"{r_['top20_median_ret']:.2f}% median DD {r_['top20_median_dd']:.2f}%", flush=True)
+    # Kraken-data check (test window; universes ranked by Kraken volume)
+    kp = _universe_panel('kraken')
+    print(f'\n=== Kraken data check (pool {len(kp.coins)} coins, Kraken daily candles, Kraken volume ranks)')
+    for u, s in specs.items():
+        km = _masks(kp, s, [cut])
+        best = results['universes'][u]['best']
+        m = pb.momentum_sim(kp, best, cut, None, universe=km[cut])
+        results['universes'][u]['eval']['kraken test'] = m
+        print(f"   {u:16s} trades {m['trades']:4d} win {m['win_rate']:5.1f}% ret {m['return_pct']:8.2f}% maxDD {m['max_dd']:6.2f}%")
+    # drawdown reducers on the cur10 baseline and on every universe's chosen set
+    print('\n=== drawdown reducers (test; each row changes one thing vs the chosen set)')
+    reducers = {'as chosen': {}, 'consensus 2-of-3 (30/60/90)': {'lookback_days': 'cons'},
+                'vol target 60%': {'vol_target': 0.6}, 'no vol target': {'vol_target': None},
+                'breadth >= 50% above SMA50': {'breadth': 0.5}, 'no breadth filter': {'breadth': 0},
+                'abs filter on': {'abs_filter': True}, 'cap 20% per coin': {'max_weight': 0.2},
+                'exposure 50%': {'exposure': 0.5}}
+    for u in specs:
+        best = results['universes'][u]['best']
+        row = {}
+        for rn, chg in reducers.items():
+            p = {**best, **chg}
+            row[rn] = {'train': _momu_run((u, p, train_lo, cut, {}))[2], 'test': _momu_run((u, p, cut, None, {}))[2]}
+        results['universes'][u]['reducers'] = row
+        print(f'  {u}: ' + ' | '.join(f"{rn}: {v['test']['return_pct']:.1f}%/{v['test']['max_dd']:.1f}"
+                                      for rn, v in row.items()))
+    # benchmarks
+    print('\n=== benchmarks (100% invested at the period start)')
+    btc = panel.coins.index('BTC')
+    for name, (lo, hi) in {'train': (train_lo, cut), 'test': (cut, None), 'test1': (cut, mid), 'test2': (mid, None)}.items():
+        i = int(np.searchsorted(panel.ts, lo)) - 1
+        row = {'BTC': pb.buy_hold(panel, [btc], lo, hi)}
+        for u in [x for x in ('cur10', 'orig5', 'dyn20', 'dyn30') if x in masks]:
+            row[f'EW {u}'] = pb.ew_hold(panel, masks[u][lo][i], lo, hi)
+        results.setdefault('benchmarks', {})[name] = row
+        print(f'   {name:6s} ' + ' | '.join(f"{k_}: {v['return_pct']:.2f}% DD {v['max_dd']:.2f}%" for k_, v in row.items()))
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(results, f, indent=1, default=str)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['fetch', 'tune', 'compare', 'strategies'])
+    ap.add_argument('cmd', choices=['fetch', 'tune', 'compare', 'strategies', 'universes'])
     ap.add_argument('--timeframe', default='4h')
     ap.add_argument('--extras', action='store_true', help='tune on watchlist + BTC/ETH/XRP/LINK/ADA')
     ap.add_argument('--procs', type=int, default=os.cpu_count() or 2)
@@ -557,6 +754,7 @@ def main():
     ap.add_argument('--min-trades', type=int, default=0)
     ap.add_argument('--out', default=None)
     ap.add_argument('--verbose', action='store_true')
+    ap.add_argument('--sensitivity', action='store_true', help='universes: post-hoc liquidity-rule variants')
     ap.add_argument('--only', default=None, help='strategies: trend_1d | trend_4h | momentum_1d')
     ap.add_argument('--max-stop', type=float, default=None, help='only consider STOP_LOSS_PCT <= this')
     ap.add_argument('--max-hold', type=int, default=None, help='only consider MAX_HOLD_HOURS <= this')
@@ -568,6 +766,8 @@ def main():
         compare(args, best)
     elif args.cmd == 'strategies':
         strategies(args)
+    elif args.cmd == 'universes':
+        universes(args)
     else:
         compare(args)
 
