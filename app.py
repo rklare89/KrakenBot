@@ -940,7 +940,7 @@ def backtest_on_dataframe(df, timeframe=TIMEFRAME, start_cash=BACKTEST_START_CAS
         "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
         "trades": trades,
         "open_position": amount > 0,
-        "days": round(days, 1),
+        "days": round(float(days), 1),
         "pnls": pnls,
     }
 
