@@ -532,8 +532,9 @@ def strategies(args):
         print(f"   {name:6s} BTC: ret {b1['return_pct']:8.2f}% maxDD {b1['max_dd']:6.2f}% | EW10: ret {b10['return_pct']:8.2f}% "
               f"maxDD {b10['max_dd']:6.2f}% | EW5: ret {b5['return_pct']:8.2f}% maxDD {b5['max_dd']:6.2f}%")
         results.setdefault('benchmarks', {})[name] = {'btc': b1, 'ew10': b10, 'ew5': b5}
-    for preset in ('conservative', 'tuned_a'):
-        p = dict(OLD_PARAMS, **{k_: v for k_, v in app.STRATEGY_PRESETS[preset].items() if k_ in PARAM_KEYS})
+    for preset in ('old', 'conservative', 'tuned_a'):
+        p = OLD_PARAMS if preset == 'old' else \
+            dict(OLD_PARAMS, **{k_: v for k_, v in app.STRATEGY_PRESETS[preset].items() if k_ in PARAM_KEYS})
         apply_params(p)
         for label, syms in (('10', WATCH + EXTRA), ('5', WATCH)):
             full = load('coinbase', '4h', syms)

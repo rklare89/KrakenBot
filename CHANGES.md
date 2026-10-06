@@ -67,7 +67,7 @@ to `bot_state.dryrun.json` and `trade_ledger.dryrun.json`. No API keys are neede
 is still **live** trading, as before.
 
 ## New env vars
-`STRATEGY_PRESET` (conservative | tuned_a; see tuning section), `DRY_RUN`, `DRY_RUN_USD_BALANCE`, `DASHBOARD_HOST` (default 127.0.0.1), `DASHBOARD_PORT` (5000),
+`STRATEGY_PRESET` (conservative | tuned_a | trend; see the tuning and alternative-strategies sections), `DRY_RUN`, `DRY_RUN_USD_BALANCE`, `DASHBOARD_HOST` (default 127.0.0.1), `DASHBOARD_PORT` (5000),
 `DASHBOARD_USER` (admin), `DASHBOARD_PASSWORD` (unset = no auth). `KRAKEN_API_KEY` and
 `KRAKEN_SECRET_KEY` are unchanged.
 
@@ -205,3 +205,156 @@ preset; the default watchlist is unchanged.
 - **The comparison isn't fully clean.** I saw test results while trying the tighter-stop
   variant, so treat its comparison as indicative. No setting was moved toward a better test
   number.
+
+## Alternative strategies (Oct 2026): daily trend following holds up out of sample; added as opt-in `trend` preset
+
+I tested two different strategy types with the same method as the RSI tuning. **Daily
+Donchian-breakout trend following** made money out of sample while BTC and the coin basket
+lost about 21–22%. Its drawdown was under 15%, and its parameter neighbourhood was positive too.
+It is now available as an **opt-in** preset, `STRATEGY_PRESET=trend`. **Momentum rotation**
+also made money out of sample, but its drawdowns were 27–33%. That is too much for this bot,
+so it is documented here but **not implemented**. The default preset is still `conservative`.
+
+### Method (`python optimize.py strategies`; simulator in `portfolio_backtest.py`)
+- **Data:**
+  - Coinbase public 1h USD candles from Jan 2023, resampled to 4h and daily, used as a proxy
+    for Kraken (closes are within a few bps).
+  - Cross-check on Kraken's own daily candles (720, covering the whole test window).
+- **Split:** tune on **Jan 2023 – 11 Jun 2025**; test once on **12 Jun 2025 – 5 Oct 2026**.
+  The test period is also reported in two halves.
+- **Universe:** SOL, AVAX, DOGE, NEAR, SUI, BTC, ETH, XRP, LINK, ADA. The original 5
+  (SOL, AVAX, DOGE, NEAR, SUI) are reported separately.
+- **Account:** a single portfolio, up to 80% invested.
+  - Trend: k slots of 80%/k of equity each.
+  - Momentum: 80%/top_k per coin.
+- **Costs and fills:**
+  - Fees are 0.25% maker for limit entries and exits, and 0.40% taker plus 0.1% slippage for
+    stop exits.
+  - All signals use closed candles and fill at the **next candle's open**.
+  - Stops are checked inside each candle and fill at the lower of the open and the stop.
+  - Stress test: every fill charged as taker.
+- **Selection:** the set picked had the best *neighbour-smoothed* train score
+  (return / max(maxDD, 5%), averaged with its grid neighbours). Test results were never used
+  to choose.
+- **Grids:**
+  - Trend: entry 20/30/55 d; MA filter none/100/200 d; ATR trail none/2/3/4/6×; Donchian
+    exit none/10/20 d; BTC>200d regime filter on/off; k = 1/3/5/10. That is 1008 sets per
+    timeframe, on daily and on 4h.
+  - Momentum: lookback 30/60/90 d; top 1/2/3; rebalance every 3/7/14 d; absolute-momentum
+    filter on/off. Coins are held only while BTC > its 200-day MA. Rotation is charged maker
+    fees on the coins that change.
+
+### Out-of-sample results (portfolio level, $1000 start, 12 Jun 2025 – 5 Oct 2026)
+
+| Strategy | Coins | Trades | Win % | Net return | Max DD |
+|---|---|---|---|---|---|
+| **Trend, daily** (chosen) | 10 | 28 | 53.6 | **+9.22%** | **13.9%** |
+| Trend, daily, all-taker | 10 | 28 | 53.6 | +8.48% | 14.1% |
+| Trend, daily, **Kraken data** | 10 | 28 | 50.0 | +9.24% | 14.7% |
+| Trend, daily | original 5 | 13 | 53.8 | +7.31% | 9.6% |
+| Trend, daily, Kraken data | original 5 | 13 | 53.8 | +8.30% | 9.8% |
+| Trend, daily: test half 1 / half 2 | 10 | 13 / 15 | 38 / 67 | −6.78% / +17.17% | 13.6% / 6.7% |
+| Trend, 4h (30d entry, no ATR) | 10 | 41 | 41.5 | +11.98% | 20.7% |
+| Trend, 4h | original 5 | 20 | 40.0 | +10.35% | 12.4% |
+| Momentum (30d, top 3, 3-day rebalance, abs filter) | 10 | 38 | 44.7 | +40.36% | 26.8% |
+| Momentum, Kraken data | 10 | 38 | 47.4 | +39.68% | 28.2% |
+| Momentum | original 5 | 25 | 52.0 | +38.42% | 32.5% |
+| Momentum: test half 1 / half 2 | 10 | 24 / 11 | 38 / 36 | −1.39% / +31.12% | 26.3% / 10.5% |
+| Momentum without BTC regime filter (ablation) | 10 | 62 | 38.7 | −15.63% | 63.0% |
+| *Hold USD* | – | 0 | – | 0.00% | 0% |
+| *Buy & hold BTC* | 1 | – | – | −20.79% | 53.1% |
+| *Equal-weight buy & hold, 10 coins* | 10 | – | – | −22.28% | 69.6% |
+| *Equal-weight buy & hold, original 5* | 5 | – | – | −19.76% | 72.4% |
+| *RSI old (original rules, 4h)* | 10 / 5 | 0 / 0 | – | 0.00% | 0% |
+| *RSI conservative (4h)* | 10 / 5 | 0 / 0 | – | 0.00% | 0% |
+| *RSI tuned_a (4h, one coin at a time)* | 10 / 5 | 19 / 13 | 89.5 / 84.6 | +2.21% / −6.45% | 19.7% / 16.1% |
+
+Train period, for reference:
+- Trend, daily: +174% with 18.1% max DD.
+- Momentum: +467% with 40.0% max DD.
+- BTC buy-and-hold: +551% with 28.2% max DD.
+
+In the bull market, trend following lags holding by a wide margin. Its value is mainly in
+cutting losses in a falling market.
+
+**Robustness of the daily trend set.** Each row changes one setting; test return / max DD:
+- Default: +9.2% / 13.9%.
+- Entry 30 d: +9.5% / 18.9%. Entry 20 d: +10.9% / 21.9%.
+- MA 100: +6.5% / 16.8%. No MA filter: +6.8% / 17.3%.
+- ATR 4×: +11.7% / 12.0%. No ATR trail: +8.8% / 14.3%.
+- 20-day exit: +18.9% / 12.7%.
+- BTC regime filter: +4.4% / 13.8%.
+- All 20 of the top-20 train sets were positive on test, with a median of +7.9% (4h: 20/20,
+  median +13.2%).
+- **Position count matters a lot:** k=5 gives +13.8% / 23.4%, k=3 gives +48.4% / 15.7%, and
+  k=1 gives +124% / 19.4%. Those smaller-k results come from very few trades (5 for k=1) and
+  were poor in train (k=1: +28.5% with 45% DD). k=10, which diversifies the most, was chosen
+  on train and is kept.
+
+### Why daily trend and not 4h or momentum
+- **4h trend** gave similar results with a larger drawdown (20.7%). It can't be checked on
+  Kraken data, because 720 4h candles don't cover a 200-day MA. Daily candles are also much
+  less sensitive to fill timing.
+- **Momentum** had the highest return, but with 27–33% drawdowns. It always holds 1–3
+  correlated coins whenever BTC is above its 200-day MA. It also depends heavily on the
+  regime filter: without it, momentum lost 15.6% with a 63% drawdown. Its train drawdown was
+  40–50%. That doesn't meet the "safe trades" goal, so it is not implemented. The simulator
+  and grid remain in `optimize.py` / `portfolio_backtest.py`.
+
+### What the `trend` preset does (`STRATEGY_PRESET=trend`, `STRATEGY_MODE='trend'`)
+- **Entries:**
+  - Uses Kraken **daily** candles for the 10 coins above.
+  - **Entry:** the closed daily candle's close is above the prior 55-day high *and* above the
+    200-day SMA.
+  - Candidates are ranked by breakout strength.
+  - Each position buys **8% of equity** (80% / 10), capped by free USD, as a **post-only**
+    limit order at the bid. Entries are retried during that day and skipped if price has run
+    more than 3% (`TREND_MAX_ENTRY_CHASE_PCT`) above the signal close.
+- **Exits:**
+  - **Normal exit:** a daily close below the prior 10-day low. The bot sells post-only at the
+    ask and escalates to a marketable limit after `TREND_EXIT_MAX_ATTEMPTS` (4) unfilled
+    tries.
+  - **ATR trailing stop:** set at 6 × ATR(14) below the highest close, raised only. It is
+    checked against the ticker on every loop. When hit, the bot sells with a marketable limit
+    capped at `STOP_LOSS_MAX_SLIPPAGE_PCT` below the bid, with a
+    `STOP_LOSS_ORDER_TIMEOUT_SEC` timeout. If it doesn't fill, the exit stays flagged and is
+    retried on every loop.
+- **Safety features kept, extended to multi-position:**
+  - Positions live in `state["positions"]` and are written atomically.
+  - Fills are taken from real order data (partial fills and dust handled).
+  - Each order has a `pending_order` entry with `userref`, plus startup recovery (`mode: portfolio`).
+  - Startup reconcile checks each position against balances.
+  - `DRY_RUN` uses the paper wallet.
+  - The `DASHBOARD_PASSWORD` auth is unchanged.
+  - The bot won't trade if it finds a position from the other mode (RSI vs trend).
+- **Dashboard:** shows a breakout-signal table and an Open Positions card.
+- **New constants:** `STRATEGY_MODE` ('rsi'), `TREND_TIMEFRAME` ('1d'), `TREND_ENTRY_DAYS`
+  (55), `TREND_MA_DAYS` (200), `TREND_EXIT_DAYS` (10), `TREND_ATR_MULT` (6),
+  `TREND_ATR_PERIOD` (14), `TREND_MAX_POSITIONS` (10), `TREND_REGIME_FILTER` (False),
+  `TREND_MAX_ENTRY_CHASE_PCT` (0.03), `TREND_EXIT_MAX_ATTEMPTS` (4).
+- **Shared logic:** the signal and stop functions (`donchian_high/low`, `wilder_atr`,
+  `trend_entry_signal`, `trend_exit_signal`, `trend_initial_stop`, `trend_update_stop`,
+  `trend_stop_hit`) are shared by the live loop and `portfolio_backtest.trend_sim`.
+- **Tests:** `tests/test_offline.py` has 15 new checks for live trend mode, 89 in total. They
+  pass under each preset (`STRATEGY_PRESET=conservative|tuned_a|trend`) with the network
+  blocked.
+- Try it with `DRY_RUN=true STRATEGY_PRESET=trend python app.py` first.
+
+### Caveats
+- **One test regime.** The test period is a down market. Trend following is expected to do
+  well there relative to holding, but it **lost 6.8% in the first half** of the test period.
+  Profits came from the second half's rebound. Expect long flat or losing stretches; the
+  win rate is about 50%.
+- **Small sample:** 28 test trades. A different number of slots changes results a lot (see
+  the k sensitivity above).
+- **The history is a proxy.** It's Coinbase prices. The Kraken daily cross-check matches
+  closely (+9.24% vs +9.22%), but it covers only the test window.
+- **Fills are modelled.** The model assumes post-only orders fill at the next open, and
+  breakouts can gap away from the limit price. The 3% chase limit means some real entries
+  will be skipped. The all-taker stress test (+8.5%) covers the fee side but not missed fills.
+- **The live multi-position code is new.** It is tested only offline against a fake
+  exchange, never against the real Kraken API. Run it in `DRY_RUN` for a while first.
+  Positions need at least $10 each (8% of equity), so the account needs more than about
+  $125.
+- **Momentum's results** came from a forced regime filter that the train grid itself did not
+  prefer, which is a further reason not to rely on it.
