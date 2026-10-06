@@ -191,10 +191,10 @@ def run_grid(grid, dfs_by_part, tf, procs):
 
 def print_table(rows, title):
     print(f'\n== {title}')
-    hdr = f"{'set':28s} {'part':6s} {'trades':>6s} {'win%':>6s} {'meanRet%':>9s} {'medRet%':>8s} {'+/-syms':>8s} {'worstDD%':>9s} {'avgTrade%':>9s}"
+    hdr = f"{'set':52s} {'part':6s} {'trades':>6s} {'win%':>6s} {'meanRet%':>9s} {'medRet%':>8s} {'+/-syms':>8s} {'worstDD%':>9s} {'avgTrade%':>9s}"
     print(hdr)
     for name, part, s in rows:
-        print(f"{name:28s} {part:6s} {s['trades']:6d} {s['win_rate']:6.1f} {s['mean_ret']:9.2f} {s['median_ret']:8.2f} "
+        print(f"{name:52s} {part:6s} {s['trades']:6d} {s['win_rate']:6.1f} {s['mean_ret']:9.2f} {s['median_ret']:8.2f} "
               f"{s['pos_syms']:>3d}/{s['neg_syms']:<3d}  {s['worst_dd']:9.2f} {s['avg_trade_pct']:9.3f}")
 
 
@@ -258,11 +258,15 @@ def portfolio_sim(dfs, tf, start_cash=app.BACKTEST_START_CASH):
 
 
 # ----------------------------------------------------------------------------- main
+CATEGORICAL = ('TREND_FILTER', 'RSI_ENTRY_MODE')
+
+
 def neighbours(p, axes):
-    """Grid neighbours of p: change one parameter by one step along its axis."""
+    """Grid neighbours of p: change one ORDINAL parameter by one step along its axis
+    (categorical choices like the trend filter have no meaningful 'neighbour')."""
     out = []
     for k, vals in axes.items():
-        if k not in p or p[k] not in vals:
+        if k in CATEGORICAL or k not in p or p[k] not in vals:
             continue
         i = vals.index(p[k])
         for j in (i - 1, i + 1):
@@ -309,7 +313,19 @@ def tune(args):
                  'STOP_LOSS_PCT': [0.03, 0.05, 0.08, 0.12],
                  'MAX_HOLD_HOURS': [48, 72, 120, 240],
                  'STOPLOSS_COOLDOWN_HOURS': [0, 24, 72]}
-    top_entries = [{k: p[k] for k in entry_axes} for p, _ in ranked1[:args.top_entries]]
+    if args.max_stop:
+        exit_axes['STOP_LOSS_PCT'] = [x for x in exit_axes['STOP_LOSS_PCT'] if x <= args.max_stop]
+    if args.max_hold:
+        exit_axes['MAX_HOLD_HOURS'] = [x for x in exit_axes['MAX_HOLD_HOURS'] if x <= args.max_hold]
+    # top entry rules by TRAIN score; also include every RSI-threshold neighbour of them so
+    # the neighbour smoothing below can see the threshold's sensitivity
+    top_entries = []
+    for p, _ in ranked1[:args.top_entries]:
+        for thr in entry_axes['RSI_OVERSOLD']:
+            if abs(entry_axes['RSI_OVERSOLD'].index(thr) - entry_axes['RSI_OVERSOLD'].index(p['RSI_OVERSOLD'])) <= 1:
+                e = {'RSI_OVERSOLD': thr, 'TREND_FILTER': p['TREND_FILTER'], 'RSI_ENTRY_MODE': p['RSI_ENTRY_MODE']}
+                if e not in top_entries:
+                    top_entries.append(e)
     grid2 = [dict(e, **dict(zip(exit_axes, v))) for e in top_entries for v in itertools.product(*exit_axes.values())]
     t0 = time.time()
     res2 = run_grid(grid2, parts, tf, args.procs)
@@ -325,8 +341,8 @@ def tune(args):
     ranked2 = sorted(res2, key=lambda r: robust(r[0]), reverse=True)
     rows = []
     for p, o in ranked2[:10]:
-        name = (f"{p['RSI_ENTRY_MODE'][:5]} {p['RSI_OVERSOLD']} {p['TREND_FILTER'][:6]} tp{p['TAKE_PROFIT_PCT']} "
-                f"sl{p['STOP_LOSS_PCT']}")
+        name = (f"{p['RSI_ENTRY_MODE'][:2]}{p['RSI_OVERSOLD']} {p['TREND_FILTER'][3:9]} tp{p['TAKE_PROFIT_PCT']} "
+                f"tr{p['TRAIL_PCT']}/{p['TRAIL_ACTIVATE_PCT']} sl{p['STOP_LOSS_PCT']} h{p['MAX_HOLD_HOURS']} cd{p['STOPLOSS_COOLDOWN_HOURS']}")
         rows += [(name, 'train', summarize(o['train'])), ('', 'test', summarize(o['test']))]
     print_table(rows, 'stage 2 - top 10 by neighbour-smoothed TRAIN score (TEST shown for information only)')
     best = ranked2[0][0]
@@ -341,12 +357,20 @@ def tune(args):
 
 
 def compare(args, new_params=None):
+    """Out-of-sample comparison: original settings vs the shipped default vs presets
+    (and the freshly tuned set when called from `tune`)."""
     tf = args.timeframe
-    new_params = new_params or current_params()
-    sets = [('old', OLD_PARAMS), ('new', new_params)]
+    strip = lambda p: {k: v for k, v in p.items() if k in PARAM_KEYS}
+    sets = [('old', OLD_PARAMS), ('default', current_params())]
+    for name, p in app.STRATEGY_PRESETS.items():
+        if p:
+            sets.append((name, dict(OLD_PARAMS, **strip(p))))
+    if new_params:
+        sets.append(('tuned', dict(OLD_PARAMS, **strip(new_params))))
+    baseline = current_params()
+    set_cutoff(load('coinbase', tf, WATCH + EXTRA))
     for label, syms in (('watchlist', WATCH), ('watchlist+extras', WATCH + EXTRA)):
         full = load('coinbase', tf, syms)
-        set_cutoff(load('coinbase', tf, WATCH + EXTRA))
         kr = load('kraken', tf, syms)
         rows, port = [], []
         for name, p in sets:
@@ -354,21 +378,33 @@ def compare(args, new_params=None):
             for part in ('train', 'test'):
                 per = {b: app.backtest_on_dataframe(split(d, part), tf) for b, d in full.items()}
                 rows.append((f'{name} [{label}]', part, summarize(per)))
-                if part == 'test':
-                    port.append((name, part, portfolio_sim({b: split(d, 'test') for b, d in full.items()}, tf)))
+            # Test period in two halves (regime stability)
+            mid = CUTOFF_MS + (max(int(d['timestamp'].iloc[-1]) for d in full.values()) - CUTOFF_MS) // 2
+            for half, lo, hi in (('test1', CUTOFF_MS, mid), ('test2', mid, 1 << 62)):
+                per = {b: app.backtest_on_dataframe(
+                    d[(d['timestamp'] >= lo) & (d['timestamp'] < hi)].reset_index(drop=True), tf)
+                    for b, d in full.items()}
+                rows.append((f'{name} [{label}]', half, summarize(per)))
+            # Stress: every fill pays the taker fee (post-only entries/exits not achieved)
+            maker = app.MAKER_FEE
+            app.MAKER_FEE = app.TAKER_FEE
+            per = {b: app.backtest_on_dataframe(split(d, 'test'), tf) for b, d in full.items()}
+            rows.append((f'{name} [{label}] all-taker', 'test', summarize(per)))
+            app.MAKER_FEE = maker
             per = {b: app.backtest_on_dataframe(d, tf) for b, d in kr.items()}
             rows.append((f'{name} [{label}]', 'kraken', summarize(per)))
+            port.append((name, 'test', portfolio_sim({b: split(d, 'test') for b, d in full.items()}, tf)))
             port.append((name, 'kraken', portfolio_sim(kr, tf)))
-            if args.verbose and label == 'watchlist':
+            if args.verbose:
                 for b, d in full.items():
                     r = app.backtest_on_dataframe(split(d, 'test'), tf)
                     print(f"   {name} {b} test: trades {r['trades']} win {r['win_rate']} ret {r['return_pct']} dd {r['max_drawdown_pct']}")
-        print_table(rows, f'old vs new, {tf}, {label} (per-symbol backtests; test & kraken are out-of-sample)')
-        print(f'   live-like rotation portfolio ({label}):')
+        print_table(rows, f'{tf}, {label}: per-symbol backtests (test/test1/test2/kraken are out-of-sample)')
+        print(f'   live-like rotation portfolio, one position at a time ({label}):')
         for name, part, r in port:
-            print(f'     {name:4s} {part:6s} trades {r["trades"]:4d} win {r["win_rate"]:5.1f}% '
+            print(f'     {name:12s} {part:6s} trades {r["trades"]:4d} win {r["win_rate"]:5.1f}% '
                   f'return {r["return_pct"]:7.2f}% maxDD {r["max_dd"]:6.2f}%')
-    apply_params(new_params)
+    apply_params(baseline)
 
 
 def main():
@@ -381,6 +417,8 @@ def main():
     ap.add_argument('--min-trades', type=int, default=0)
     ap.add_argument('--out', default=None)
     ap.add_argument('--verbose', action='store_true')
+    ap.add_argument('--max-stop', type=float, default=None, help='only consider STOP_LOSS_PCT <= this')
+    ap.add_argument('--max-hold', type=int, default=None, help='only consider MAX_HOLD_HOURS <= this')
     args = ap.parse_args()
     if args.cmd == 'fetch':
         fetch()

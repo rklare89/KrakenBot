@@ -62,7 +62,7 @@ TREND_FILTER = 'ema50'             # 'ema50':       close > EMA50
 #                                    'none':        no trend filter
 EMA_LONG_PERIOD = 200
 EMA_SLOPE_LOOKBACK = 6
-STOPLOSS_COOLDOWN_HOURS = 0        # after a stop-loss exit, no new entry on that symbol for
+STOPLOSS_COOLDOWN_HOURS = 72       # after a stop-loss exit, no new entry on that symbol for
 #                                    this many hours (0 or None = no cooldown)
 RSI_OVERBOUGHT = 68
 USE_RSI_OVERBOUGHT_EXIT = False    # optional extra exit (off by default). When on, it
@@ -112,6 +112,33 @@ BACKTEST_DAYS = 180                # NOTE: Kraken's OHLC API only serves the lat
 BACKTEST_START_CASH = 1000.0
 BACKTEST_TAKER_SLIPPAGE_PCT = 0.001  # extra slippage assumed on stop-loss (taker) exits
 SCANNER_REFRESH_SEC = 3600
+
+# --- Strategy presets ----------------------------------------------------------------
+# Tuning (optimize.py, Oct 2026; Coinbase 4h history Jan 2023 - Oct 2026, train = first
+# 65% of the calendar span, test = last 35% (Jun 2025 - Oct 2026), plus Kraken's own last
+# 120 days) found NO parameter set that was robustly profitable out-of-sample on the
+# 5-coin watchlist. The default is therefore the conservative preset: the original rules
+# (which rarely trigger) plus a 72h post-stop-loss cooldown. See CHANGES.md.
+#
+# 'tuned_a' is the best train-period set (RSI<33 dip-buying above EMA200, quick +2%
+# target, wide 12% stop, up to 10 days hold) on a 10-coin universe. Out-of-sample it was
+# only marginally positive (+1.9% mean per coin over 16 months, 7/10 coins up, rotation
+# portfolio +2.2% with ~20% max drawdown) and NEGATIVE on the 5-coin watchlist alone.
+# It is opt-in only: try it with DRY_RUN=true STRATEGY_PRESET=tuned_a first.
+STRATEGY_PRESETS = {
+    'conservative': {},
+    'tuned_a': dict(
+        WATCHLIST=['SOL/USD', 'AVAX/USD', 'DOGE/USD', 'NEAR/USD', 'SUI/USD',
+                   'BTC/USD', 'ETH/USD', 'XRP/USD', 'LINK/USD', 'ADA/USD'],
+        RSI_OVERSOLD=33, RSI_ENTRY_MODE='below', TREND_FILTER='ema200',
+        TAKE_PROFIT_PCT=0.02, TRAIL_PCT=0.02, TRAIL_ACTIVATE_PCT=0.015,
+        STOP_LOSS_PCT=0.12, MAX_HOLD_HOURS=240, STOPLOSS_COOLDOWN_HOURS=72,
+    ),
+}
+STRATEGY_PRESET = os.getenv("STRATEGY_PRESET", "conservative").strip().lower()
+if STRATEGY_PRESET not in STRATEGY_PRESETS:
+    raise SystemExit(f"Unknown STRATEGY_PRESET {STRATEGY_PRESET!r}; choose one of {sorted(STRATEGY_PRESETS)}")
+globals().update(STRATEGY_PRESETS[STRATEGY_PRESET])
 
 # --- Files -------------------------------------------------------------------------
 LEDGER_FILE = 'trade_ledger.dryrun.json' if DRY_RUN else 'trade_ledger.json'
@@ -1300,7 +1327,8 @@ def trading_iteration(exchange):
 
 def run_trading_bot():
     logging.info(f"Starting multi-asset rotation trading bot loop... "
-                 f"({'DRY RUN - no real orders' if DRY_RUN else 'LIVE TRADING'})")
+                 f"({'DRY RUN - no real orders' if DRY_RUN else 'LIVE TRADING'}; "
+                 f"preset '{STRATEGY_PRESET}': {strategy_description()}; watchlist {WATCHLIST})")
     if not DRY_RUN and not (os.getenv("KRAKEN_API_KEY") and os.getenv("KRAKEN_SECRET_KEY")):
         logging.error("KRAKEN_API_KEY / KRAKEN_SECRET_KEY not set. Set them, or run with "
                       "DRY_RUN=true to paper trade. Trading loop not started.")
