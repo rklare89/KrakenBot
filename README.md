@@ -3,7 +3,7 @@ A Windows service that places trades on Kraken Pro, with a Flask dashboard.
 
 ## Running
 ```
-pip install ccxt pandas numpy flask
+pip install ccxt pandas numpy flask python-dotenv
 set KRAKEN_API_KEY=...            (not needed with DRY_RUN=true)
 set KRAKEN_SECRET_KEY=...
 set DRY_RUN=true                  (paper trading: no orders are sent)
